@@ -69,7 +69,7 @@ from lighthouse.ingress.mlir_gen.named import times_weights
 from lighthouse.pipeline.driver import TransformDriver
 from lighthouse.execution.runner import Runner
 from lighthouse.execution import GPUMemoryManager
-from lighthouse.schedule.xegpu import xegpu_to_binary, xegpu_parameter_selector
+from lighthouse.schedule.xegpu import xegpu_to_binary, XeGPUParameterSelector
 from lighthouse.schedule.xegpu.mlp_schedule import xegpu_wg_annotation_for_mlp_layer
 from lighthouse.ingress.mlir_gen import get_mlir_elem_type
 from lighthouse.ingress.mlir_gen.gpu_attention_payload import generate_gpu_attention_payload
@@ -106,36 +106,6 @@ from lighthouse.schedule.xegpu import fused_attention_schedule
 # between kernels through device buffers (`gpu.alloc`) that stay on the GPU -- no
 # round-trip to the host between ops.
 # =============================================================================
-
-
-def install_dialect_module_stubs():
-    """Work around a toolchain deadlock by silencing a benign-but-repeated error.
-
-    MLIR's Python bindings probe `mlir.dialects.<name>` for every op when building
-    op views. For dialects that have no Python module (xegpu, xevm, and some custom
-    transform ops) this probe raises a C++ ModuleNotFoundError that is caught but
-    NEVER cached -- so it re-throws on every op. That repeated exception races with
-    the Intel GPU compiler's (libocloc) signal handler and DEADLOCKS the process.
-
-    Fix: install a sys.meta_path finder that hands back an empty stub module for any
-    otherwise-missing `mlir.dialects.<name>`, so the probe succeeds (and is cached)
-    and the exception never fires. This is what lets the whole model run IN ONE
-    PROCESS (no subprocess-per-kernel workaround). See memory.md part 4.
-    """
-    import types, importlib.abc, importlib.machinery
-    prefix = "mlir.dialects."
-    class F(importlib.abc.MetaPathFinder, importlib.abc.Loader):
-        def find_spec(self, fullname, path, target=None):
-            # Only handle direct children `mlir.dialects.<name>`, and only as a
-            # last resort (appended at the END of meta_path, so real modules win).
-            if fullname.startswith(prefix) and fullname.count(".") == 2:
-                return importlib.machinery.ModuleSpec(fullname, self)
-            return None
-        def create_module(self, spec):
-            return types.ModuleType(spec.name)   # empty stub
-        def exec_module(self, module):
-            pass
-    sys.meta_path.append(F())
 
 
 F32 = lambda: ir.F32Type.get()   # 32-bit float (used for accumulation / norms)
@@ -390,9 +360,10 @@ class Builder:
 # ---------------------------------------------------------------------------
 
 
-def _causal_mha(q, k, v, H, causal=True):
+def _mha(q, k, v, H, causal=False):
     """Multi-head attention over (T,C) q/k/v (already projected), per-head, with an
-    optional causal mask. Returns (T,C). Mirrors the fused kernel's math."""
+    optional causal mask. Returns (T,C). Mirrors the fused kernel's math, which is
+    non-causal (PR #153 has no causal path yet), so `causal` defaults to False."""
     T, C = q.shape
     hs = C // H
     scale = 1.0 / (hs ** 0.5)
@@ -430,12 +401,12 @@ def _emit_block_fused(bld, x, w, T, C, hidden, H, eps, out_buf=None):
     return bld.add(a, o, T, C, out_buf=out_buf)
 
 
-def numpy_ref_block_fused(x, w, H, eps=1e-5, causal=True):
-    """Multi-head block reference (matches _emit_block_fused; causal)."""
+def numpy_ref_block_fused(x, w, H, eps=1e-5, causal=False):
+    """Multi-head block reference (matches _emit_block_fused)."""
     ln1 = _f16(_ln(x, w["g1"], w["b1n"], eps))
     q = _f16(ln1 @ w["wq"].astype(np.float32)); k = _f16(ln1 @ w["wk"].astype(np.float32))
     v = _f16(ln1 @ w["wv"].astype(np.float32))
-    attn = _causal_mha(q, k, v, H, causal)
+    attn = _mha(q, k, v, H, causal)
     proj = _f16(attn) @ w["wp"].astype(np.float32) + w["bp"]
     a = x + proj
     ln2 = _f16(_ln(a, w["g2"], w["b2n"], eps))
@@ -626,10 +597,11 @@ def _fuse_attention_in_region(anytype, forall, fa_params):
     v_load = transform.get_producer_of_operand(anytype, second_contract, operand_number=1)
     mulf_op = match_and_split(forall, ops={"arith.mulf"}, nhandles=1)[0]
     scale = transform.get_producer_of_operand(anytype, mulf_op, operand_number=1)
+    # NB: the merged fused-attention op is non-causal only -- there is
+    # no `causal` parameter yet, so the model runs as non-causal attention.
     transform_ext.replace_with_fused_attention(
         q_load=q_load, k_load=k_load, v_load=v_load, scale=scale,
-        output=second_contract, tile_size=fa_params["inner_loop_tile_size"],
-        causal=fa_params.get("causal", False))
+        output=second_contract, tile_size=fa_params["inner_loop_tile_size"])
 
 
 def xegpu_fa_annotation(gf, anytype, fa_params):
@@ -1000,16 +972,19 @@ def main():
         n_layer = int(sys.argv[sys.argv.index("--gpt-layers") + 1])
     # mm/sm params drive the non-attention kernels (matmul, layernorm); fa_params
     # drives the fused attention kernel (proven values).
-    mm_params = dict(xegpu_parameter_selector.get_matmul_parameters(T, C, C))
+    param_selector = XeGPUParameterSelector()
+    mm_params = dict(param_selector.get_parameters((T, C, C)))
+    # gpu_specs rides along in mm_params: the matmul tiler ignores it, while the
+    # XeGPU wg annotation (called via **mm_params) requires it.
+    mm_params["gpu_specs"] = param_selector.gpu_specs
     sm_params = {"wg_rows": 64, "sg_rows": 8, "subgroup_size": 16,
                  "reduction_step_size": 16, "T": T}
     fa_params = {"batch_size": 1, "num_heads": H, "n_ctx": T, "n_head": C // H,
                  "wg_rows": 128, "sg_rows": 16, "subgroup_size": 16,
-                 "inner_loop_tile_size": 64, "causal": True}
+                 "inner_loop_tile_size": 64}
 
     with ir.Context(), ir.Location.unknown():
         lh_dialects.register_and_load()
-        install_dialect_module_stubs()
         mod, kinds = build_gpt_fused_payload("payload", T, C, hidden, vocab, n_layer, H)
         if dump == "initial":
             print(mod); print("KINDS:", kinds); return
