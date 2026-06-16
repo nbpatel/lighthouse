@@ -298,6 +298,9 @@ class Builder:
         return emit_buf_to_tensor(self._heads_view_of(buf2d, T, H, hs), restrict=True)
 
     # ---- fused multi-head attention core on 3D (H,T,hs) f16 -> (H,T,hs) f16 ----
+    # (named attention_4d because it is the canonical 4D (Z,H,T,hs) attention
+    #  algorithm with the batch dim Z=1 FOLDED OUT: one sequence, so (1,H,T,hs)
+    #  collapses to (H,T,hs) and linalg.batch_matmul treats H as the batch axis.)
     def attention_4d(self, Qh, Kh, Vh, H, T, hs, out_view, out_view_memref):
         # Emits the SAME linalg op sequence as generate_gpu_attention_payload
         # (batch_matmul QK^T -> scale-mul -> softmax -> batch_matmul @V), so the
@@ -423,17 +426,17 @@ def build_gpt_fused_payload(func_name, T, C, hidden, vocab, n_layer, H, eps=1e-5
     NON-CAUSAL (no mask), wq/wk/wv/wp are (C,C). Embeddings done host-side."""
     f32, f16 = F32(), F16()
     mod = ir.Module.create()
-    x_t = ir.MemRefType.get((T, C), f32)
-    g_t = ir.MemRefType.get((C,), f32)
-    wqkv_t = ir.MemRefType.get((C, C), f16)
-    wproj_t = ir.MemRefType.get((C, C), f16)
-    bvec_t = ir.MemRefType.get((C,), f32)
-    w1_t = ir.MemRefType.get((C, hidden), f16)
-    b1_t = ir.MemRefType.get((hidden,), f32)
-    w2_t = ir.MemRefType.get((hidden, C), f16)
-    lmw_t = ir.MemRefType.get((C, vocab), f16)
-    lmb_t = ir.MemRefType.get((vocab,), f32)
-    out_t = ir.MemRefType.get((T, vocab), f32)
+    x_t = ir.MemRefType.get((T, C), f32)          # input activations (256,256) f32
+    g_t = ir.MemRefType.get((C,), f32)            # layernorm gamma/beta vectors (256,) f32
+    wqkv_t = ir.MemRefType.get((C, C), f16)       # q/k/v projection weights (256,256) f16
+    wproj_t = ir.MemRefType.get((C, C), f16)      # attention output proj weight (256,256) f16
+    bvec_t = ir.MemRefType.get((C,), f32)         # bias vectors (256,) f32
+    w1_t = ir.MemRefType.get((C, hidden), f16)    # FFN up-projection (256,1024) f16
+    b1_t = ir.MemRefType.get((hidden,), f32)      # FFN hidden bias (1024,) f32
+    w2_t = ir.MemRefType.get((hidden, C), f16)    # FFN down-projection (1024,256) f16
+    lmw_t = ir.MemRefType.get((C, vocab), f16)    # lm_head weight (256,256) f16
+    lmb_t = ir.MemRefType.get((vocab,), f32)      # lm_head bias (256,) f32
+    out_t = ir.MemRefType.get((T, vocab), f32)    # output logits (256,256) f32
     # per-layer arg types: g1,b1n, wq,wk,wv, wp,bp, g2,b2n, w1,bb1,w2,bb2 (13) -- NO mask.
     per_layer = [g_t, g_t, wqkv_t, wqkv_t, wqkv_t, wproj_t, bvec_t,
                  g_t, g_t, w1_t, b1_t, w2_t, bvec_t]
@@ -641,7 +644,7 @@ def xegpu_fa_annotation(gf, anytype, fa_params):
         xegpu.set_anchor_layout(d, sg_layout=out_sg_layout, sg_data=out_sg_data, inst_data=out_inst_data, index=2)
 
 
-def build_combined_schedule(mm_params, sm_params, kinds, stop_at_stage="", fa_params=None):
+def build_combined_schedule(mm_params, ln_params, kinds, stop_at_stage="", fa_params=None):
     """Build the transform-dialect schedule module for a payload with op classes
     `kinds`. Counts how many of each class there are, then delegates to `_bundle`
     (wrapped in transform boilerplate). `stop_at_stage` lets callers halt early
@@ -656,7 +659,7 @@ def build_combined_schedule(mm_params, sm_params, kinds, stop_at_stage="", fa_pa
         func0 = match(named_seq.bodyTarget, ops={"func.func"})
         mod = transform.get_parent_op(anytype, func0, op_name="builtin.module", deduplicate=True)
         try:
-            _bundle(mod, mm_params, sm_params, kinds, n_mm, n_ln, n_sm, n_ew, stop_at_stage,
+            _bundle(mod, mm_params, ln_params, kinds, n_mm, n_ln, n_sm, n_ew, stop_at_stage,
                     fa_params=fa_params)
         except PipelineInterrupt:
             pass
@@ -665,7 +668,7 @@ def build_combined_schedule(mm_params, sm_params, kinds, stop_at_stage="", fa_pa
     return schedule
 
 
-def _bundle(mod, mm_params, sm_params, kinds, n_mm, n_ln, n_sm, n_ew, stop_at_stage="",
+def _bundle(mod, mm_params, ln_params, kinds, n_mm, n_ln, n_sm, n_ew, stop_at_stage="",
             fa_params=None):
     """THE PASS ORCHESTRATOR -- emits the actual sequence of transform ops.
 
@@ -678,8 +681,8 @@ def _bundle(mod, mm_params, sm_params, kinds, n_mm, n_ln, n_sm, n_ew, stop_at_st
     Reading the inline comments here is the best way to understand "which part of
     the code schedules the passes" -- it is this function, top to bottom."""
     anytype = transform.AnyOpType.get()
-    rss = sm_params["reduction_step_size"]
-    wg_rows = sm_params["wg_rows"]
+    rss = ln_params["reduction_step_size"]
+    wg_rows = ln_params["wg_rows"]
     nkernels = len(kinds)
     n_fa = kinds.count("fa")
 
@@ -722,7 +725,7 @@ def _bundle(mod, mm_params, sm_params, kinds, n_mm, n_ln, n_sm, n_ew, stop_at_st
     for i, (mean_red, var_red, normalize) in enumerate(ln_slices):
         ln_untiled = n_ln - i
         _tile_one_layernorm(mod, anytype, wg_rows, rss, mean_red, var_red, normalize,
-                            ln_untiled, n_mm, sm_params["T"])
+                            ln_untiled, n_mm, ln_params["T"])
 
     # 2) Tile EW generics into own foralls (handles preserved across ln tiling).
     for eg in ew_handles:
@@ -809,7 +812,7 @@ def _bundle(mod, mm_params, sm_params, kinds, n_mm, n_ln, n_sm, n_ew, stop_at_st
     # launch threads per kernel, in IR (build) order = `kinds`.
     launches = match_and_split(mod, ops={"gpu.launch"}, nhandles=nkernels)
     mm_threads = (mm_params["wg_m"] // mm_params["sg_m"]) * (mm_params["wg_n"] // mm_params["sg_n"]) * 16
-    sm_threads = (sm_params["wg_rows"] // sm_params["sg_rows"]) * sm_params["subgroup_size"]
+    sm_threads = (ln_params["wg_rows"] // ln_params["sg_rows"]) * ln_params["subgroup_size"]
     fa_threads = ((fa_params["wg_rows"] // fa_params["sg_rows"]) * fa_params["subgroup_size"]
                   if fa_params else 0)
     for launch, kind in zip(launches, kinds):
@@ -824,7 +827,7 @@ def _bundle(mod, mm_params, sm_params, kinds, n_mm, n_ln, n_sm, n_ew, stop_at_st
     if stop_at_stage == "gpu-outlining":
         raise PipelineInterrupt()
 
-    mod = apply_registered_pass(mod, "xevm-attach-target", options={"O": "3", "chip": "bmg"})
+    mod = apply_registered_pass(mod, "xevm-attach-target", options={"O": "3", "chip": "pvc"})
 
     # per-gpu.module convert-vector-to-xegpu. ONLY ln/sm need SLM allocas (their
     # cross-lane reductions go through shared local memory -> store_matrix). The
@@ -832,8 +835,8 @@ def _bundle(mod, mm_params, sm_params, kinds, n_mm, n_ln, n_sm, n_ew, stop_at_st
     # to SLM creates store_matrix paths with no valid layout -> "Expected layout
     # for non-1D vectors". So SLM-ify ln/sm only; leave ew (and mm) as store_nd.
     gpu_mods = match_and_split(mod, ops={"gpu.module"}, nhandles=nkernels)
-    sg_layout = [sm_params["sg_rows"], 1]
-    sg_data = [sm_params["sg_rows"], rss]
+    sg_layout = [ln_params["sg_rows"], 1]
+    sg_data = [ln_params["sg_rows"], rss]
     for gm, kind in zip(gpu_mods, kinds):
         gf = match(gm, ops={"gpu.func"})
         if kind in ("ln", "sm"):
@@ -962,7 +965,7 @@ def main():
     if "--dump" in sys.argv:
         dump = sys.argv[sys.argv.index("--dump") + 1]
 
-    # Kernel-friendly shapes: T=C=256 (q/k/v/proj matmuls clear the DPAS gate),
+    # Kernel-friendly shapes: T=C=256 (q/k/v/proj matmuls),
     # hidden=1024, vocab=256, n_layer=6 (gpt.py depth). True multi-head: H heads of
     # head_size=C/H=64 -- the fused flash kernel handles head_size=64 fine.
     T, C, hidden = 256, 256, 1024
@@ -971,13 +974,11 @@ def main():
     if "--gpt-layers" in sys.argv:
         n_layer = int(sys.argv[sys.argv.index("--gpt-layers") + 1])
     # mm/sm params drive the non-attention kernels (matmul, layernorm); fa_params
-    # drives the fused attention kernel (proven values).
+    # drives the fused attention kernel.
     param_selector = XeGPUParameterSelector()
     mm_params = dict(param_selector.get_parameters((T, C, C)))
-    # gpu_specs rides along in mm_params: the matmul tiler ignores it, while the
-    # XeGPU wg annotation (called via **mm_params) requires it.
     mm_params["gpu_specs"] = param_selector.gpu_specs
-    sm_params = {"wg_rows": 64, "sg_rows": 8, "subgroup_size": 16,
+    ln_params = {"wg_rows": 64, "sg_rows": 8, "subgroup_size": 16,
                  "reduction_step_size": 16, "T": T}
     fa_params = {"batch_size": 1, "num_heads": H, "n_ctx": T, "n_head": C // H,
                  "wg_rows": 128, "sg_rows": 16, "subgroup_size": 16,
@@ -989,7 +990,7 @@ def main():
         if dump == "initial":
             print(mod); print("KINDS:", kinds); return
 
-        sched = build_combined_schedule(dict(mm_params), dict(sm_params), kinds,
+        sched = build_combined_schedule(dict(mm_params), dict(ln_params), kinds,
                                         stop_at_stage=(dump or ""), fa_params=dict(fa_params))
         if dump == "schedule":
             print(sched); return
@@ -1010,7 +1011,7 @@ def main():
         cb = Runner.get_gpu_argument_access_callback(out, arg_index=0)
         sc = 0.05   # small weight scale -> O(1) activations so f16 stays accurate
 
-        # full model, fused multi-head causal attn per block.
+        # full model, fused multi-head attn per block.
         # host "embeddings": simulate token+pos embedding sum as the input x.
         x = (np.random.randn(T, C) * 0.5).astype(np.float32)
         layers = []
