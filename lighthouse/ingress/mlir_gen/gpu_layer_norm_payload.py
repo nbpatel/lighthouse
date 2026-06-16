@@ -4,7 +4,6 @@ from mlir import ir
 from mlir.dialects import linalg, bufferization, tensor, arith, math
 
 from lighthouse.utils.mlir import func_cif
-from lighthouse.ingress.mlir_gen.gpu_utils import emit_gpu_util_funcs
 from lighthouse.ingress.mlir_gen.utils import (
     emit_buf_to_tensor,
     affine_map,
@@ -103,7 +102,14 @@ def generate_gpu_layer_norm_payload(
             @linalg.generic(
                 [input_tensor, mean_sum, var_sum, gamma_tensor, beta_tensor],
                 [out_init],
-                [par_map_2d, red_map_2d, red_map_2d, bias_map_2d, bias_map_2d, par_map_2d],
+                [
+                    par_map_2d,
+                    red_map_2d,
+                    red_map_2d,
+                    bias_map_2d,
+                    bias_map_2d,
+                    par_map_2d,
+                ],
                 [parallel, parallel],
             )
             def normalized(x, m_sum, v_sum, g, b, _out):
@@ -119,9 +125,5 @@ def generate_gpu_layer_norm_payload(
             bufferization.materialize_in_destination(
                 None, normalized, output, restrict=True, writable=True
             )
-
-        # Emit utility functions for GPU memory management
-        emit_gpu_util_funcs(dtype, rank=2)
-        emit_gpu_util_funcs(dtype, rank=1)
 
     return mod
