@@ -1,7 +1,7 @@
-"""gpt2.py -- nano-GPT / GPT-2-style forward on the Intel GPU (XeGPU), with
-FUSED/FLASH multi-head attention.
+""" nano-GPT / GPT-2-style forward pass on the Intel GPU (XeGPU), with
+FLASH multi-head attention.
 
-This is a GPT-2/nanoGPT block stack: each transformer block is
+This is a nanoGPT block stack: each transformer block is
     a = x + attn_proj( MultiHeadAttention( ln1(x) ) )       # attention sublayer
     y = a + ffn( ln2(a) )                                    # MLP sublayer
     ffn(z) = Linear(C, 4C) -> ReLU -> Linear(4C, C)
@@ -9,10 +9,10 @@ and the full model is
     x = token_emb + pos_emb            # embeddings (done host-side)
     for _ in range(n_layer): x = Block(x)
     x = ln_f(x); logits = x @ lm_head
-TRUE multi-head: H heads of head_size = C/H = 64 (GPT-2 style), computed by ONE
+TRUE multi-head: H heads of head_size = C/H = 64, computed by ONE
 fused flash-attention kernel per block.
 
-The attention is the FUSED/FLASH kernel : standard
+The attention is the FLASH/FUSED kernel : standard
 attention is built on 4D tensors (Z, H, n_ctx, head_size) at the linalg level,
 then a transform-dialect schedule rewrites the whole Q@K^T -> softmax -> @V region
 into ONE kernel that tiles the K/V reduction dim and carries a running max/sum (the
@@ -21,15 +21,10 @@ materialized. Everything else (layernorm, the q/k/v/proj/ffn/lm_head matmuls, th
 casts/bias/residual elementwise ops) is lowered as its own XeGPU kernel; the whole
 model is ONE MLIR module with on-device buffers handing off between kernels.
 
-  CAUSAL: attention is causal (GPT-style) -- query position qi only attends to key
-  positions kj <= qi. The mask is applied INSIDE the flash kernel: future entries
-  of each Q@K^T tile are set to -inf before the running max/exp (so they vanish in
-  the softmax). This is the `causal=True` path of replace_with_fused_attention.
-
 Config: n_layer=6, C=256, H=4 (head_size=64), hidden=1024, vocab=256, T=256.
 
 Builds the FULL model (n_layer blocks -> ln_f -> lm_head), with FUSED multi-head
-CAUSAL attention per block.
+NON-CAUSAL attention per block.
 
 Bridging the model's 2D (T,C) activations to the fused kernel's multi-head
 (H,T,hs) layout uses NO on-device transpose kernel: each q/k/v projection buffer
@@ -41,7 +36,6 @@ memref.transpose -- pure layout, zero compute), and the fused schedule's
 Run:
   .venv/bin/python examples/xegpu/gpt2.py [--gpt-layers N] [--check]
   .venv/bin/python examples/xegpu/gpt2.py [--dump STAGE]
-  (PYTHONPATH is auto-set via the isolated LLVM .pth -- no export needed.)
 """
 import sys
 import numpy as np
@@ -133,7 +127,7 @@ class Builder:
     each kernel correctly. Classes:
       'mm'  = matmul (linalg.matmul)          -> DPAS systolic-array kernel
       'ln'  = layernorm (3 generics + 2 fills) -> reduction kernel (uses shared mem)
-      'fa'  = fused/flash multi-head attention -> ONE kernel (QK^T->softmax->@V,
+      'fa'  = flash multi-head attention -> ONE kernel (QK^T->softmax->@V,
               online-softmax over K/V tiles); see attention_4d + the fused-attention
               schedule helpers. (Softmax lives INSIDE this kernel, not as its own.)
       'ew'  = elementwise (cast / bias / relu / residual) -> simple row-parallel kernel
@@ -332,7 +326,7 @@ class Builder:
 
     # ---- fused multi-head attention(ln_f32 (T,C) f32) -> (T,C) f16, NON-CAUSAL ----
     def fused_attention(self, x, wq, wk, wv, T, C, H):
-        # True multi-head attention via the fused/flash kernel, with NO on-device
+        # True multi-head attention via the flash kernel, with NO on-device
         # head-transpose kernel. Flow:
         #   x(f32) -cast-> f16 -q/k/v proj-> (T,C) f16 buffers -heads_view (free)->
         #   (H,T,hs) strided views -> attention_4d (fused flash kernel) -> @V written
@@ -366,7 +360,7 @@ class Builder:
 def _mha(q, k, v, H, causal=False):
     """Multi-head attention over (T,C) q/k/v (already projected), per-head, with an
     optional causal mask. Returns (T,C). Mirrors the fused kernel's math, which is
-    non-causal (PR #153 has no causal path yet), so `causal` defaults to False."""
+    non-causal, so `causal` defaults to False."""
     T, C = q.shape
     hs = C // H
     scale = 1.0 / (hs ** 0.5)
@@ -422,7 +416,7 @@ def numpy_ref_block_fused(x, w, H, eps=1e-5, causal=False):
 
 def build_gpt_fused_payload(func_name, T, C, hidden, vocab, n_layer, H, eps=1e-5):
     """Full gpt.py forward as ONE module, with FUSED multi-head attention per block
-    (R3/R4). Like build_gpt_payload but: multi-head (H heads, fused/flash attention),
+    (R3/R4). Multi-head (H heads, flash attention),
     NON-CAUSAL (no mask), wq/wk/wv/wp are (C,C). Embeddings done host-side."""
     f32, f16 = F32(), F16()
     mod = ir.Module.create()
@@ -482,7 +476,7 @@ def build_gpt_fused_payload(func_name, T, C, hidden, vocab, n_layer, H, eps=1e-5
 
 
 def numpy_ref_gpt_fused(x, layer_w, gf_g, gf_b, lmw, lmb, H, eps=1e-5):
-    """Non-causal multi-head full-gpt reference (matches build_gpt_fused)."""
+    """Non-causal multi-head full-gpt reference."""
     h = x
     for w in layer_w:
         h = numpy_ref_block_fused(h, w, H, eps)
@@ -949,7 +943,7 @@ def _f16(a):
 
 def main():
     """Entry point. Builds the FULL gpt model (n_layer blocks -> ln_f -> lm_head),
-    fused/flash multi-head CAUSAL attention per block. Flags:
+    flash multi-head NON-CAUSAL attention per block. Flags:
       --gpt-layers N               : number of transformer layers (default 6)
       --check                      : run on the GPU and compare to the numpy reference
       --dump STAGE                 : print IR at a stage and exit, one of
