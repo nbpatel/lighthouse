@@ -110,7 +110,7 @@ class Builder:
         return emit_buf_to_tensor(buf, restrict=True)
 
     # ---- RMSNorm(x (M,N) f32, weight (N,)) -> (M,N) f32 buffer ----
-    def rmsnorm(self, x, weight, M, N, eps=1e-5):
+    def rmsnorm(self, x, weight, M, N, eps=1e-5, out_buf=None):
         # RMSNorm: out[i,j] = x[i,j] * rsqrt(mean_k x[i,k]^2 + eps) * weight[j].
         # No mean-subtraction (unlike LayerNorm). Built from 2 linalg.generic ops:
         #   (1) ss[i]     = sum_k x[i,k]^2                  (row reduction)
@@ -133,7 +133,7 @@ class Builder:
             return arith.AddFOp(arith.MulFOp(v, v).result, acc)
 
         # (2) normalize + scale -> output
-        buf = self._buf((M, N), f32)
+        buf = out_buf if out_buf is not None else self._buf((M, N), f32)
         out_t = emit_buf_to_tensor(buf, restrict=True, writable=True)
 
         @linalg.generic(
@@ -151,6 +151,8 @@ class Builder:
             None, normed, buf, restrict=True, writable=True
         )
         self.kinds.append("rms")
+        if out_buf is not None:
+            return None
         return emit_buf_to_tensor(buf, restrict=True)
 
     # ---- elementwise cast f32 -> f16 ----
@@ -170,10 +172,10 @@ class Builder:
         return emit_buf_to_tensor(buf, restrict=True)
 
     # ---- silu (swish): out = x * sigmoid(x)  (x (M,N) f32) ----
-    def silu(self, x, M, N):
+    def silu(self, x, M, N, out_buf=None):
         par2 = self._par()
         one = arith.constant(self.f32, 1.0)
-        buf = self._buf((M, N), self.f32)
+        buf = out_buf if out_buf is not None else self._buf((M, N), self.f32)
         out_t = emit_buf_to_tensor(buf, restrict=True, writable=True)
 
         @linalg.generic([x], [out_t], [par2, par2], [parallel, parallel])
@@ -187,6 +189,8 @@ class Builder:
             None, s, buf, restrict=True, writable=True
         )
         self.kinds.append("ew")
+        if out_buf is not None:
+            return None
         return emit_buf_to_tensor(buf, restrict=True)
 
     # ---- elementwise multiply: out = a * b  (both (M,N) f32) ----

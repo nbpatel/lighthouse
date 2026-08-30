@@ -414,6 +414,14 @@ def _bundle(
         )
 
     # 2) Tile ew generics into own foralls (handles preserved across rms tiling).
+    #    Tile BOTH dims (rows x cols): a row-only tile leaves the full column width
+    #    as one per-subgroup vector, so at large widths (the FFN `hidden`) the
+    #    kernel's live vector (sg_rows x W x 4B) overruns the register file and the
+    #    device faults. `ew_wg_cols` bounds the column block so register pressure is
+    #    O(sg_rows x ew_wg_cols) regardless of W. sg_layout keeps 1 subgroup in the
+    #    column dim (the subgroup iterates rss-wide blocks), so the anchor layout is
+    #    unchanged. Widths smaller than the tile just yield one (clamped) tile.
+    ew_wg_cols = ln_params.get("ew_wg_cols", 256)
     for eg in ew_handles:
         structured.structured_tile_using_forall(
             anytype,
@@ -421,7 +429,7 @@ def _bundle(
             eg,
             num_threads=[],
             tile_sizes=[],
-            static_tile_sizes=(wg_rows,),
+            static_tile_sizes=(wg_rows, ew_wg_cols),
         )
 
     # 3) Tile RoPE generics. Each iterates (head, T-row, coord) over a head-outer
@@ -439,9 +447,10 @@ def _bundle(
 
     # 4) Matmuls (their EW producers already wrapped in foralls). Each matmul uses
     #    its own params (narrow K/V projections tile differently from wide matmuls).
-    mms = match_and_split(mod, ops={"linalg.matmul"}, nhandles=n_mm)
-    for mm, mmp in zip(mms, mm_params_list):
-        _tile_one_matmul(mm, anytype, mmp)
+    if n_mm:
+        mms = match_and_split(mod, ops={"linalg.matmul"}, nhandles=n_mm)
+        for mm, mmp in zip(mms, mm_params_list):
+            _tile_one_matmul(mm, anytype, mmp)
 
     # 5) Fused-attention regions. Done last so the generic pre-split above ran while
     #    each fa softmax was still one linalg.softmax (its decomposition generics
