@@ -57,7 +57,7 @@ from lighthouse.schedule.xegpu.lowering_common import convert_to_gpu_launch
 from llama3_payload import F32
 
 
-def _tile_one_matmul(matmul_op, anytype, mm_params):
+def _tile_one_matmul(matmul_op, mm_params):
     """Tile one matmul for DPAS: a work-group `forall` tile (wg_m x wg_n) with any
     elementwise consumer fused in, then an inner reduction (k) loop. Tile sizes
     come from `mm_params` (chosen by xegpu_parameter_selector for the GPU)."""
@@ -75,16 +75,37 @@ def _tile_one_matmul(matmul_op, anytype, mm_params):
     lh_transform.tile(wg_matmul, tile_sizes=[0, 0, mm_params["k_tile"]])
 
 
-def _tile_one_fused_attention_region(anytype, qkt_bmm, pv_bmm, softmax_op, fa_params):
+def _tile_one_fused_attention_region(
+    qkt_bmm: ir.Value,
+    pv_bmm: ir.Value,
+    softmax_op: ir.Value,
+    fa_params: dict,
+) -> tuple[ir.Value, ir.Value]:
     """Tile + fuse one attention region (QK^T -> scale -> softmax -> @V) into a
     single scf.forall, so it vectorizes/bufferizes into one kernel body that
     `replace_with_fused_attention` later rewrites into the flash loop.
 
-    Operates on PRE-SPLIT, per-region
-    handles (qkt_bmm, pv_bmm, softmax_op) so it is region-local and works at any
-    multiplicity. All further producers are pulled in via get_producer_of_operand
-    (SSA-walk = inherently scoped to this region)."""
-    prod = transform.get_producer_of_operand
+    Operates on PRE-SPLIT, per-region handles so it is region-local and works at
+    any multiplicity. All further producers are pulled in via
+    get_producer_of_operand (SSA-walk = inherently scoped to this region).
+
+    Args:
+        qkt_bmm: handle of the QK^T `linalg.generic` op for this region.
+        pv_bmm: handle of the attention-weights @ V `linalg.generic` op.
+        softmax_op: handle of the region's (still un-decomposed) `linalg.softmax`.
+        fa_params: fused-attention params (e.g. `wg_rows`).
+
+    Returns:
+        (func, forall): the enclosing `func.func` handle and the region's tiled
+        `scf.forall` handle.
+    """
+    anytype = transform.AnyOpType.get()
+
+    def get_producer(op, operand_number):
+        """Handle of the op producing `op`'s operand (hides the anytype arg)."""
+        return transform.get_producer_of_operand(
+            anytype, op, operand_number=operand_number
+        )
 
     def fuse(p, c):
         return structured.structured_fuse_into_containing_op(
@@ -108,7 +129,7 @@ def _tile_one_fused_attention_region(anytype, qkt_bmm, pv_bmm, softmax_op, fa_pa
         anytype, forall, op_name="func.func", deduplicate=True
     )
     # 2. Fuse the @V output init fill (producer of forall operand 0).
-    forall = fuse(prod(anytype, forall, operand_number=0), forall)
+    forall = fuse(get_producer(forall, 0), forall)
     transform.apply_cse(func)
     canonicalize(func)
     # 3. Decompose this region's softmax. linalg.softmax -> 4 generics + 2 fills:
@@ -124,20 +145,20 @@ def _tile_one_fused_attention_region(anytype, qkt_bmm, pv_bmm, softmax_op, fa_pa
     # each once in consumer->producer topological order.
     # tiled_pv operand 0 is the aw extract_slice inside the forall; hop through it
     # to the func-scope softmax `div` that it slices.
-    aw_slice = prod(anytype, tiled_pv, operand_number=0)
-    div = prod(anytype, aw_slice, operand_number=0)  # num / den (softmax out)
-    num = prod(anytype, div, operand_number=0)  # exp generic
-    den = prod(anytype, div, operand_number=1)  # sum-reduce generic
-    den_fill = prod(anytype, den, operand_number=1)  # 0 fill (sum acc)
-    mx = prod(anytype, num, operand_number=1)  # max-reduce generic
-    mx_fill = prod(anytype, mx, operand_number=1)  # -inf fill (max acc)
-    scaled = prod(anytype, num, operand_number=0)  # linalg.mul (qkt*scale)
-    scale_fill = prod(anytype, scaled, operand_number=1)  # scale-constant fill
-    qkt = prod(anytype, scaled, operand_number=0)  # QK^T generic
+    aw_slice = get_producer(tiled_pv, 0)
+    div = get_producer(aw_slice, 0)  # num / den (softmax out)
+    num = get_producer(div, 0)  # exp generic
+    den = get_producer(div, 1)  # sum-reduce generic
+    den_fill = get_producer(den, 1)  # 0 fill (sum acc)
+    mx = get_producer(num, 1)  # max-reduce generic
+    mx_fill = get_producer(mx, 1)  # -inf fill (max acc)
+    scaled = get_producer(num, 0)  # linalg.mul (qkt*scale)
+    scale_fill = get_producer(scaled, 1)  # scale-constant fill
+    qkt = get_producer(scaled, 0)  # QK^T generic
     # Q/K are block-arg views (operands 0/1), fused as loads later; operand 2 is
     # the qkt accumulator fill. No K^T transpose op: the QK^T generic contracts the
     # head-dim directly, reading K as (seq, head_dim).
-    qkt_fill = prod(anytype, qkt, operand_number=2)  # 0 fill (qkt acc)
+    qkt_fill = get_producer(qkt, 2)  # 0 fill (qkt acc)
     for p in (
         div,
         den,
@@ -286,12 +307,13 @@ def build_combined_schedule(
     for debugging (--dump <stage>).
 
     `mm_params_list` (optional) gives per-matmul DPAS params in build order (one
-    dict per 'mm' in `kinds`); when omitted every matmul reuses `mm_params`. The
-    narrow K/V projections need their own wg_n/sg_n, so the driver passes a list."""
-    n_mm = kinds.count("mm")
-    n_rms = kinds.count("rms")
-    n_sm = kinds.count("sm")
-    n_ew = kinds.count("ew")
+    dict per 'matmul' in `kinds`); when omitted every matmul reuses `mm_params`.
+    The narrow K/V projections need their own wg_n/sg_n, so the driver passes a
+    list."""
+    n_mm = kinds.count("matmul")
+    n_rms = kinds.count("rmsnorm")
+    n_sm = kinds.count("softmax")
+    n_ew = kinds.count("elementwise")
     if mm_params_list is None:
         mm_params_list = [mm_params] * n_mm
     with schedule_boilerplate() as (schedule, named_seq):
@@ -346,7 +368,7 @@ def _bundle(
     rss = ln_params["reduction_step_size"]
     wg_rows = ln_params["wg_rows"]
     nkernels = len(kinds)
-    n_fa = kinds.count("fa")
+    n_fa = kinds.count("fused_attention")
     n_rope = kinds.count("rope")
     if mm_params_list is None:
         mm_params_list = [mm_params] * n_mm
@@ -359,46 +381,46 @@ def _bundle(
     # generic is still matched (just nested), so the remaining bare generics can't
     # be re-matched by count. Split all generic handles once up front (their build
     # order is deterministic), then tile each using its preserved handle. A handle
-    # to op X stays valid across tiling of other ops. Tile the simple ew generics
-    # first (no fusion/cleanup, so rms handles survive), then the rmsnorms (which
-    # fuse + cleanup).
+    # to op X stays valid across tiling of other ops. Tile the simple elementwise
+    # generics first (no fusion/cleanup, so rmsnorm handles survive), then the
+    # rmsnorms (which fuse + cleanup).
     #
     # Generic build order: each rmsnorm contributes [ss_sum, normed] (2), each
     # elementwise contributes 1, each RoPE contributes 1 (one multi-output generic),
     # and each fused-attention contributes [QK^T, @V] (2) -- the GQA QK^T and @V
     # contractions are linalg.generic ops (not batch_matmul) indexing the narrow
     # K/V by the outer kv dim, emitted right after the q/k/v cast ews. The slices are
-    # reconstructed from `kinds`. 'fa' softmax generics do not exist yet (fa is
-    # tiled last, softmax still un-decomposed). The fa core's linalg.mul (scale) is a
-    # named op, not a generic, so excluded. (The head reshape is a pure memref view
-    # -- no generic, no kernel; see Builder.heads_view.)
+    # reconstructed from `kinds`. 'fused_attention' softmax generics do not exist
+    # yet (it is tiled last, softmax still un-decomposed). The attention core's
+    # linalg.mul (scale) is a named op, not a generic, so excluded. (The head reshape
+    # is a pure memref view -- no generic, no kernel; see Builder.heads_view.)
     ngen_total = 2 * n_rms + n_ew + n_rope + 2 * n_fa
-    gen_handles = transform.split_handle(
-        (anytype,) * ngen_total, match(mod, ops={"linalg.generic"})
-    )
-    # Walk kinds to assign generic handles to ops. 'fa's kinds entry follows its
-    # four q/k/v/x cast ews, so gi has advanced past them and lands on (QK^T, @V).
+    gen_handles = match_and_split(mod, ops={"linalg.generic"}, nhandles=ngen_total)
+    # Walk kinds to assign generic handles to ops. The 'fused_attention' kinds entry
+    # follows its four q/k/v/x cast ews, so gi has advanced past them and lands on
+    # (QK^T, @V).
     rms_slices, ew_handles, rope_handles, fa_slices = [], [], [], []
     gi = 0
     for k in kinds:
-        if k == "rms":
+        if k == "rmsnorm":
             rms_slices.append((gen_handles[gi], gen_handles[gi + 1]))
             gi += 2
-        elif k == "ew":
+        elif k == "elementwise":
             ew_handles.append(gen_handles[gi])
             gi += 1
         elif k == "rope":
             rope_handles.append(gen_handles[gi])
             gi += 1
-        elif k == "fa":
+        elif k == "fused_attention":
             fa_slices.append((gen_handles[gi], gen_handles[gi + 1]))
             gi += 2
-        # mm contributes no bare linalg.generic here
+        # matmul contributes no bare linalg.generic here
 
     # 1) Tile rmsnorms first, using preserved (ss_sum, normed) handles.
-    #    Doing this before ew/matmul tiling keeps the bare linalg.fill pool exactly
-    #    predictable: 1*(untiled rms) + n_mm (matmul accumulator fills). ew tiling
-    #    can introduce its own init fills, so finish rms fill-fusion first.
+    #    Doing this before elementwise/matmul tiling keeps the bare linalg.fill pool
+    #    exactly predictable: 1*(untiled rmsnorm) + n_mm (matmul accumulator fills).
+    #    elementwise tiling can introduce its own init fills, so finish rmsnorm
+    #    fill-fusion first.
     for i, (ss_red, normalize) in enumerate(rms_slices):
         rms_untiled = n_rms - i
         _tile_one_rmsnorm(
@@ -413,7 +435,8 @@ def _bundle(
             ln_params["T"],
         )
 
-    # 2) Tile ew generics into own foralls (handles preserved across rms tiling).
+    # 2) Tile elementwise generics into own foralls (handles preserved across
+    #    rmsnorm tiling).
     for eg in ew_handles:
         structured.structured_tile_using_forall(
             anytype,
@@ -441,10 +464,10 @@ def _bundle(
     #    its own params (narrow K/V projections tile differently from wide matmuls).
     mms = match_and_split(mod, ops={"linalg.matmul"}, nhandles=n_mm)
     for mm, mmp in zip(mms, mm_params_list):
-        _tile_one_matmul(mm, anytype, mmp)
+        _tile_one_matmul(mm, mmp)
 
     # 5) Fused-attention regions. Done last so the generic pre-split above ran while
-    #    each fa softmax was still one linalg.softmax (its decomposition generics
+    #    each fused_attention softmax was still one linalg.softmax (its decomposition generics
     #    don't exist yet, so they can't inflate ngen_total). The QK^T/@V generics
     #    use their preserved (pre-split) handles; the softmaxes still match by count.
     #    Tile+fuse each region into one forall (softmax decompose happens in-region).
@@ -452,7 +475,7 @@ def _bundle(
         fa_softmaxes = match_and_split(mod, ops={"linalg.softmax"}, nhandles=n_fa)
         for r, (qkt_gen, pv_gen) in enumerate(fa_slices):
             _tile_one_fused_attention_region(
-                anytype, qkt_gen, pv_gen, fa_softmaxes[r], fa_params
+                qkt_gen, pv_gen, fa_softmaxes[r], fa_params
             )
 
     func = match(mod, ops={"func.func"})
@@ -508,7 +531,7 @@ def _bundle(
     if n_fa:
         all_foralls = match_and_split(mod, ops={"scf.forall"}, nhandles=nkernels)
         for idx, kind in enumerate(kinds):
-            if kind == "fa":
+            if kind == "fused_attention":
                 _fuse_attention_in_region(anytype, all_foralls[idx], fa_params)
         func = match(mod, ops={"func.func"})
         transform.apply_cse(func)
@@ -535,11 +558,11 @@ def _bundle(
     )
     mi = 0  # matmul index into mm_params_list (narrow K/V need their own threads)
     for launch, kind in zip(launches, kinds):
-        if kind == "mm":
+        if kind == "matmul":
             nt = mm_thread_count(mm_params_list[mi])
             mi += 1
         else:
-            nt = {"fa": fa_threads}.get(kind, sm_threads)
+            nt = {"fused_attention": fa_threads}.get(kind, sm_threads)
         xegpu.set_gpu_launch_threads(launch, threads=[nt, 1, 1])
 
     func = apply_registered_pass(func, "lower-affine")
@@ -554,17 +577,17 @@ def _bundle(
         mod, "xevm-attach-target", options={"O": "3", "chip": "pvc"}
     )
 
-    # per-gpu.module convert-vector-to-xegpu. Only rms needs SLM allocas (its
+    # per-gpu.module convert-vector-to-xegpu. Only rmsnorm needs SLM allocas (its
     # cross-lane reduction goes through shared local memory -> store_matrix). The
-    # ew kernels (cast/silu/mul/residual) are pure row-parallel: forcing their
-    # allocas to SLM creates store_matrix paths that fail to lower. So SLM-ify rms
-    # only; leave ew (and mm) as store_nd.
+    # elementwise kernels (cast/silu/mul/residual) are pure row-parallel: forcing
+    # their allocas to SLM creates store_matrix paths that fail to lower. So SLM-ify
+    # rmsnorm only; leave elementwise (and matmul) as store_nd.
     gpu_mods = match_and_split(mod, ops={"gpu.module"}, nhandles=nkernels)
     sg_layout = [ln_params["sg_rows"], 1]
     sg_data = [ln_params["sg_rows"], rss]
     for gm, kind in zip(gpu_mods, kinds):
         gf = match(gm, ops={"gpu.func"})
-        if kind == "rms":
+        if kind == "rmsnorm":
             allocas = match(gf, ops={"memref.alloca"})
             transform_ext.update_address_space(allocas, address_space=3)
         gf = apply_registered_pass(gf, "convert-vector-to-xegpu")
@@ -582,28 +605,28 @@ def _bundle(
         raise PipelineInterrupt()
 
     # ===== Per-kernel annotation =====
-    #   mm   -> full mlp wg annotation
-    #   rms  -> store_nd (1) + store_matrix (the SLM reduction stores)
-    #   ew   -> store_nd (1) only (pure row-parallel, no SLM)
-    #   rope -> store_nd (2, the two rotated half-blocks) only, no SLM
+    #   matmul      -> full mlp wg annotation
+    #   rmsnorm     -> store_nd (1) + store_matrix (the SLM reduction stores)
+    #   elementwise -> store_nd (1) only (pure row-parallel, no SLM)
+    #   rope        -> store_nd (2, the two rotated half-blocks) only, no SLM
     gpu_mods = match_and_split(mod, ops={"gpu.module"}, nhandles=nkernels)
     mi = 0  # matmul index into mm_params_list (narrow K/V need their own layout)
     for gm, kind in zip(gpu_mods, kinds):
         gf = match(gm, ops={"gpu.func"})
-        if kind == "mm":
+        if kind == "matmul":
             xegpu_wg_annotation_for_mlp_layer(gf, **mm_params_list[mi])
             mi += 1
-        elif kind == "fa":
+        elif kind == "fused_attention":
             xegpu_fa_annotation(gf, anytype, fa_params)
         else:
-            # rms/ew/rope: anchor-layout their store_nd(s), and (rms) its SLM
-            # store_matrix. Pass the whole match handle to set_anchor_layout (it
-            # accepts a multi-handle) -- avoids guessing exact store counts (rope
-            # has 2 store_nd, one per rotated half).
+            # rmsnorm/elementwise/rope: anchor-layout their store_nd(s), and
+            # (rmsnorm) its SLM store_matrix. Pass the whole match handle to
+            # set_anchor_layout (it accepts a multi-handle) -- avoids guessing exact
+            # store counts (rope has 2 store_nd, one per rotated half).
             xegpu.set_anchor_layout(
                 match(gf, ops={"xegpu.store_nd"}), sg_layout=sg_layout, sg_data=sg_data
             )
-            if kind == "rms":
+            if kind == "rmsnorm":
                 xegpu.set_anchor_layout(
                     match(gf, ops={"xegpu.store_matrix"}),
                     sg_layout=sg_layout,
@@ -652,12 +675,11 @@ def _tile_one_rmsnorm(
     )
     # Fusion leaves the full-size original fill DEAD at func scope (fusion only
     # slices a copy inside the forall). It must be removed or the next rms finds too
-    # many. canonicalize (DCE) at func scope, but never apply_cse at func scope --
-    # CSE would merge the identical live zero-fills ACROSS rmsnorms. CSE the
-    # duplicate generics inside the forall only (scoped), so the re-match below
-    # finds exactly 2.
+    # many. Apply plain DCE at func scope -- never apply_cse at func scope, which
+    # would merge the identical live zero-fills ACROSS rmsnorms. CSE the duplicate
+    # generics inside the forall only (scoped), so the re-match below finds exactly 2.
     transform.apply_cse(rms_forall)
-    canonicalize(rms_func)
+    transform.apply_dce(rms_func)
     # Re-match the 2 generics INSIDE the forall (scoped, so unambiguous: exactly 2),
     # then tile the normalize and the sum-of-squares reduction by rss.
     g2 = match_and_split(rms_forall, ops={"linalg.generic"}, nhandles=2)

@@ -50,21 +50,21 @@ from llama3_schedule import build_combined_schedule
 # NUMPY REFERENCE -- the same math in plain numpy, to CHECK the GPU result.
 # `_f16` rounds through float16 to model the GPU's f16 matmul precision.
 # =============================================================================
-def _rms(x, weight, eps=1e-5):
+def _numpy_rms(x, weight, eps=1e-5):
     ms = np.mean(x.astype(np.float32) ** 2, axis=-1, keepdims=True)
     return x / np.sqrt(ms + eps) * weight
 
 
-def _f16(a):
+def _numpy_f16(a):
     # round f32 -> f16 -> f32: models the precision loss of the GPU's f16 matmul.
     return a.astype(np.float16).astype(np.float32)
 
 
-def _silu(x):
+def _numpy_silu(x):
     return x / (1.0 + np.exp(-x))
 
 
-def _rope_tables(T, hs, theta=10000.0):
+def _numpy_rope_tables(T, hs, theta=10000.0):
     """Precompute (cos, sin) tables of shape (T, hs/2) for half-split RoPE.
     freq[i] = theta**(-2i/hs); angle[t,i] = t * freq[i]. Matches the payload's
     cos/sin memref args (see Builder.rope)."""
@@ -74,7 +74,7 @@ def _rope_tables(T, hs, theta=10000.0):
     return np.cos(ang).astype(np.float32), np.sin(ang).astype(np.float32)
 
 
-def _rope(x, cos, sin, nh):
+def _numpy_rope(x, cos, sin, nh):
     """Half-split (GPT-NeoX / HF-Llama) rotary embedding on (T, nh*hs) f32, per head.
     Mirrors Builder.rope: within each head, coord d (first half) pairs with d+half
     (second half): out[d]=a*cos-b*sin, out[d+half]=b*cos+a*sin. cos/sin are (T,half)."""
@@ -92,7 +92,7 @@ def _rope(x, cos, sin, nh):
     return out.reshape(T, D)
 
 
-def _mha(q, k, v, H, n_kv, causal=False):
+def _numpy_mha(q, k, v, H, n_kv, causal=False):
     """Grouped-query attention over q (T,C) and narrow k/v (T, n_kv*hs), per query
     head, with an optional causal mask. Returns (T,C). Query head h reads KV head
     h // n_rep (n_rep = H // n_kv), matching the fused kernel's floordiv K/V index.
@@ -111,7 +111,7 @@ def _mha(q, k, v, H, n_kv, causal=False):
         scores = scores - scores.max(-1, keepdims=True)
         e = np.exp(scores)
         w = e / e.sum(-1, keepdims=True)
-        attn[:, q_sl] = _f16(w) @ v[:, kv_sl]
+        attn[:, q_sl] = _numpy_f16(w) @ v[:, kv_sl]
     return attn
 
 
@@ -120,17 +120,17 @@ def numpy_ref_block_llama(x, w, cos, sin, H, n_kv, eps=1e-5, causal=False):
     are narrow (C, n_kv*hs), so k/v are (T, n_kv*hs) and _mha does the head grouping.
     RoPE is applied to q and k on the f32 projection, before the f16 cast (v skips
     RoPE) -- matching Builder.fused_attention."""
-    rms1 = _f16(_rms(x, w["an"], eps))
-    q = _f16(_rope(rms1 @ w["wq"].astype(np.float32), cos, sin, H))
-    k = _f16(_rope(rms1 @ w["wk"].astype(np.float32), cos, sin, n_kv))
-    v = _f16(rms1 @ w["wv"].astype(np.float32))
-    attn = _mha(q, k, v, H, n_kv, causal)
-    proj = _f16(attn) @ w["wo"].astype(np.float32)
+    rms1 = _numpy_f16(_numpy_rms(x, w["attn_norm"], eps))
+    q = _numpy_f16(_numpy_rope(rms1 @ w["wq"].astype(np.float32), cos, sin, H))
+    k = _numpy_f16(_numpy_rope(rms1 @ w["wk"].astype(np.float32), cos, sin, n_kv))
+    v = _numpy_f16(rms1 @ w["wv"].astype(np.float32))
+    attn = _numpy_mha(q, k, v, H, n_kv, causal)
+    proj = _numpy_f16(attn) @ w["wo"].astype(np.float32)
     h = x + proj
-    rms2 = _f16(_rms(h, w["fn"], eps))
-    gate = _silu(rms2 @ w["w1"].astype(np.float32))
+    rms2 = _numpy_f16(_numpy_rms(h, w["ffn_norm"], eps))
+    gate = _numpy_silu(rms2 @ w["w1"].astype(np.float32))
     up = rms2 @ w["w3"].astype(np.float32)
-    o = _f16(gate * up) @ w["w2"].astype(np.float32)
+    o = _numpy_f16(gate * up) @ w["w2"].astype(np.float32)
     return h + o
 
 
@@ -140,8 +140,8 @@ def numpy_ref_llama(x, layer_w, fn_w, lmw, cos, sin, H, n_kv, eps=1e-5, causal=F
     h = x
     for w in layer_w:
         h = numpy_ref_block_llama(h, w, cos, sin, H, n_kv, eps, causal)
-    hf = _rms(h, fn_w, eps)
-    return _f16(hf) @ lmw.astype(np.float32)
+    hf = _numpy_rms(h, fn_w, eps)
+    return _numpy_f16(hf) @ lmw.astype(np.float32)
 
 
 def main():
@@ -287,29 +287,31 @@ def main():
 
         # host "embeddings": simulate tok_embeddings(tokens) as the input x.
         x = (np.random.randn(T, C) * 0.5).astype(np.float32)
-        cos, sin = _rope_tables(T, hs)  # RoPE (T, hs/2) tables, shared across layers
+        cos, sin = _numpy_rope_tables(
+            T, hs
+        )  # RoPE (T, hs/2) tables, shared across layers
         layers = []
         host = [out, x, cos, sin]  # matches payload arg order: out, x, cos, sin, ...
         for _ in range(n_layers):
             lw = dict(
-                an=np.ones(C, np.float32),
+                attn_norm=np.ones(C, np.float32),
                 wq=(np.random.randn(C, C) * sc).astype(np.float16),
                 wk=(np.random.randn(C, kv_dim) * sc).astype(np.float16),
                 wv=(np.random.randn(C, kv_dim) * sc).astype(np.float16),
                 wo=(np.random.randn(C, C) * sc).astype(np.float16),
-                fn=np.ones(C, np.float32),
+                ffn_norm=np.ones(C, np.float32),
                 w1=(np.random.randn(C, hidden) * sc).astype(np.float16),
                 w2=(np.random.randn(hidden, C) * sc).astype(np.float16),
                 w3=(np.random.randn(C, hidden) * sc).astype(np.float16),
             )
             layers.append(lw)
             host += [
-                lw["an"],
+                lw["attn_norm"],
                 lw["wq"],
                 lw["wk"],
                 lw["wv"],
                 lw["wo"],
-                lw["fn"],
+                lw["ffn_norm"],
                 lw["w1"],
                 lw["w2"],
                 lw["w3"],

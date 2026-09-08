@@ -64,11 +64,12 @@ class Builder:
     `kinds` is the crucial bookkeeping: an ordered list, one entry per op emitted,
     recording its "class" so the schedule (stage 2) can later tile and annotate
     each kernel correctly. Classes:
-      'mm'  = matmul (linalg.matmul)          -> DPAS systolic-array kernel
-      'rms' = RMSNorm (2 generics + 1 fill)   -> reduction kernel (uses shared mem)
-      'fa'  = flash multi-head attention -> one kernel (QK^T->softmax->@V,
-              online-softmax over K/V tiles; causal mask added by the schedule).
-      'ew'  = elementwise (cast / silu / mul / residual) -> row-parallel kernel
+      'matmul'          = matmul (linalg.matmul)         -> DPAS systolic-array kernel
+      'rmsnorm'         = RMSNorm (2 generics + 1 fill)   -> reduction kernel (shared mem)
+      'fused_attention' = flash multi-head attention      -> one kernel (QK^T->softmax->@V,
+                          online-softmax over K/V tiles; causal mask added by the schedule).
+      'rope'            = rotary position embedding       -> head-grid row-parallel kernel
+      'elementwise'     = cast / silu / mul / residual    -> row-parallel kernel
     The op build order in the payload == the order of `kinds` == the order the
     kernels appear in the final module, which is how the schedule matches them up.
     """
@@ -91,10 +92,12 @@ class Builder:
         # access pattern where output[i,j] depends on input[i,j].
         return affine_map(rank, [ir.AffineDimExpr.get(i) for i in range(rank)])
 
-    # ---- matmul: a(M,K) f16 @ b(K,N) f16 -> (M,N) f32 buffer ----
     def matmul(self, a, b, M, N, out_buf=None):
-        # Standard C = A @ B. `times_weights` emits linalg.matmul; we first fill the
-        # accumulator with 0. f16 inputs, f32 output -- matches the DPAS hardware.
+        """Matmul C = A @ B: a(M,K) f16 @ b(K,N) f16 -> (M,N) f32 buffer.
+
+        `times_weights` emits linalg.matmul; we first fill the accumulator with 0.
+        f16 inputs, f32 output -- matches the DPAS hardware.
+        """
         buf = out_buf if out_buf is not None else self._buf((M, N), self.f32)
         out_t = emit_buf_to_tensor(buf, restrict=True, writable=True)
         acc = linalg.fill(arith.constant(self.f32, 0.0), outs=[out_t])
@@ -102,23 +105,25 @@ class Builder:
         bufferization.materialize_in_destination(
             None, res, buf, restrict=True, writable=True
         )
-        self.kinds.append("mm")
+        self.kinds.append("matmul")
         K = a.type.shape[-1]
         self.mm_shapes.append((M, N, K))
         if out_buf is not None:  # caller gave the final output buffer
             return None
         return emit_buf_to_tensor(buf, restrict=True)
 
-    # ---- RMSNorm(x (M,N) f32, weight (N,)) -> (M,N) f32 buffer ----
     def rmsnorm(self, x, weight, M, N, eps=1e-5):
-        # RMSNorm: out[i,j] = x[i,j] * rsqrt(mean_k x[i,k]^2 + eps) * weight[j].
-        # No mean-subtraction (unlike LayerNorm). Built from 2 linalg.generic ops:
-        #   (1) ss[i]     = sum_k x[i,k]^2                  (row reduction)
-        #   (2) out[i,j]  = x[i,j] * rsqrt(ss_i/N + eps) * weight[j]
-        # Affine maps:
-        #   par2  (d0,d1)->(d0,d1) : full 2-D elementwise
-        #   red2  (d0,d1)->(d0)    : reduce over j -> one value per row
-        #   bias2 (d0,d1)->(d1)    : weight indexed by column only
+        """RMSNorm(x (M,N) f32, weight (N,)) -> (M,N) f32 buffer.
+
+        out[i,j] = x[i,j] * rsqrt(mean_k x[i,k]^2 + eps) * weight[j]. No
+        mean-subtraction (unlike LayerNorm). Built from 2 linalg.generic ops:
+          (1) ss[i]     = sum_k x[i,k]^2                  (row reduction)
+          (2) out[i,j]  = x[i,j] * rsqrt(ss_i/N + eps) * weight[j]
+        Affine maps:
+          par2  (d0,d1)->(d0,d1) : full 2-D elementwise
+          red2  (d0,d1)->(d0)    : reduce over j -> one value per row
+          bias2 (d0,d1)->(d1)    : weight indexed by column only
+        """
         f32 = self.f32
         par2, red2 = self._par(), affine_map(2, [ir.AffineDimExpr.get(0)])
         bias2 = affine_map(2, [ir.AffineDimExpr.get(1)])
@@ -150,11 +155,11 @@ class Builder:
         bufferization.materialize_in_destination(
             None, normed, buf, restrict=True, writable=True
         )
-        self.kinds.append("rms")
+        self.kinds.append("rmsnorm")
         return emit_buf_to_tensor(buf, restrict=True)
 
-    # ---- elementwise cast f32 -> f16 ----
     def cast_f16(self, x, M, N):
+        """Elementwise cast f32 -> f16 -> (M,N) f16 buffer."""
         par2 = self._par()
         buf = self._buf((M, N), self.f16)
         out_t = emit_buf_to_tensor(buf, restrict=True, writable=True)
@@ -166,11 +171,11 @@ class Builder:
         bufferization.materialize_in_destination(
             None, c, buf, restrict=True, writable=True
         )
-        self.kinds.append("ew")
+        self.kinds.append("elementwise")
         return emit_buf_to_tensor(buf, restrict=True)
 
-    # ---- silu (swish): out = x * sigmoid(x)  (x (M,N) f32) ----
     def silu(self, x, M, N):
+        """SiLU / swish: out = x * sigmoid(x)  (x (M,N) f32) -> (M,N) f32 buffer."""
         par2 = self._par()
         one = arith.constant(self.f32, 1.0)
         buf = self._buf((M, N), self.f32)
@@ -186,11 +191,11 @@ class Builder:
         bufferization.materialize_in_destination(
             None, s, buf, restrict=True, writable=True
         )
-        self.kinds.append("ew")
+        self.kinds.append("elementwise")
         return emit_buf_to_tensor(buf, restrict=True)
 
-    # ---- elementwise multiply: out = a * b  (both (M,N) f32) ----
     def mul(self, a, b, M, N):
+        """Elementwise multiply: out = a * b  (both (M,N) f32) -> (M,N) f32 buffer."""
         par2 = self._par()
         buf = self._buf((M, N), self.f32)
         out_t = emit_buf_to_tensor(buf, restrict=True, writable=True)
@@ -202,11 +207,11 @@ class Builder:
         bufferization.materialize_in_destination(
             None, m, buf, restrict=True, writable=True
         )
-        self.kinds.append("ew")
+        self.kinds.append("elementwise")
         return emit_buf_to_tensor(buf, restrict=True)
 
-    # ---- residual add: out = a + b  (both (M,N) f32) ----
     def add(self, a, b, M, N, out_buf=None):
+        """Residual add: out = a + b  (both (M,N) f32) -> (M,N) f32 buffer."""
         par2 = self._par()
         buf = out_buf if out_buf is not None else self._buf((M, N), self.f32)
         out_t = emit_buf_to_tensor(buf, restrict=True, writable=True)
@@ -218,28 +223,30 @@ class Builder:
         bufferization.materialize_in_destination(
             None, r, buf, restrict=True, writable=True
         )
-        self.kinds.append("ew")
+        self.kinds.append("elementwise")
         if out_buf is not None:
             return None
         return emit_buf_to_tensor(buf, restrict=True)
 
-    # ---- RoPE (rotary position embedding), half-split -> (T,D) f32 buffer ----
     def rope(self, src_buf, cos, sin, T, D, nh):
-        # Rotary embedding on a (T, D=nh*hs) f32 projection buffer, applied per head.
-        # HALF-SPLIT (GPT-NeoX / HF-Llama) convention: within each head's hs coords,
-        # coordinate d in the first half pairs with d+hs/2 in the second half, and
-        #   out[d]        = x[d]*cos[t,d] - x[d+half]*sin[t,d]
-        #   out[d+half]   = x[d+half]*cos[t,d] + x[d]*sin[t,d]
-        # One multi-output row-parallel linalg.generic. The head-dim halves are
-        # CONTIGUOUS sub-blocks (no stride-2 gather, unlike the interleaved
-        # convention). CRUCIAL: the buffers are viewed HEAD-OUTERMOST (nh, T, hs)
-        # (the same strided transpose as heads_view), NOT (T, nh, hs). Under the
-        # (1, wg_rows, 0) tiling each grid block then owns one head's (wg_rows, half)
-        # 2D slab, which lowers to a BLOCK load_nd/store_nd. The (T, nh, hs) layout
-        # instead makes the head a middle vector dim over a big stride, which
-        # convert-vector-to-xegpu turns into a scatter/gather that crashes codegen.
-        # cos/sin are (T, half) f32, indexed (row t, coord d). Its own kind 'rope'
-        # (tiled like the fused-attention head grid, not like a flat 'ew').
+        """RoPE (rotary position embedding), half-split -> (T,D) f32 buffer.
+
+        Rotary embedding on a (T, D=nh*hs) f32 projection buffer, applied per head.
+        HALF-SPLIT (GPT-NeoX / HF-Llama) convention: within each head's hs coords,
+        coordinate d in the first half pairs with d+hs/2 in the second half, and
+          out[d]        = x[d]*cos[t,d] - x[d+half]*sin[t,d]
+          out[d+half]   = x[d+half]*cos[t,d] + x[d]*sin[t,d]
+        One multi-output row-parallel linalg.generic. The head-dim halves are
+        CONTIGUOUS sub-blocks (no stride-2 gather, unlike the interleaved
+        convention). CRUCIAL: the buffers are viewed HEAD-OUTERMOST (nh, T, hs)
+        (the same strided transpose as heads_view), NOT (T, nh, hs). Under the
+        (1, wg_rows, 0) tiling each grid block then owns one head's (wg_rows, half)
+        2D slab, which lowers to a BLOCK load_nd/store_nd. The (T, nh, hs) layout
+        instead makes the head a middle vector dim over a big stride, which
+        convert-vector-to-xegpu turns into a scatter/gather that crashes codegen.
+        cos/sin are (T, half) f32, indexed (row t, coord d). Its own kind 'rope'
+        (tiled like the fused-attention head grid, not like a flat 'elementwise').
+        """
         f32 = self.f32
         hs = D // nh
         half = hs // 2
@@ -290,8 +297,8 @@ class Builder:
         self.kinds.append("rope")
         return emit_buf_to_tensor(out_buf, restrict=True)
 
-    # ---- cast f32 (T,C) -> f16 (T,C), returning the MEMREF buffer (for views) ----
     def cast_f16_buf(self, x, T, C):
+        """Cast f32 (T,C) -> f16 (T,C), returning the MEMREF buffer (for views)."""
         par2 = self._par()
         buf = self._buf((T, C), self.f16)
         out_t = emit_buf_to_tensor(buf, restrict=True, writable=True)
@@ -303,7 +310,7 @@ class Builder:
         bufferization.materialize_in_destination(
             None, c, buf, restrict=True, writable=True
         )
-        self.kinds.append("ew")
+        self.kinds.append("elementwise")
         return buf
 
     # ---- view a (T, H*hs) memref as (H, T, hs) -- no kernel, no data move ----
@@ -374,7 +381,7 @@ class Builder:
     def attention_4d(self, Qh, Kh, Vh, n_kv, n_rep, T, hs, out_view, out_view_memref):
         # linalg op sequence: QK^T generic -> scale-mul -> softmax -> @V generic.
         # After the per-region fused tiling, these fuse into one scf.forall -> one
-        # GPU kernel (the flash/online-softmax kernel). Counts as one 'fa'.
+        # GPU kernel (the flash/online-softmax kernel). Counts as one 'fused_attention'.
         f16 = self.f16
         scale = 1.0 / (hs**0.5)
         zero = arith.constant(f16, 0.0)
@@ -426,7 +433,7 @@ class Builder:
         bufferization.materialize_in_destination(
             None, out, out_view_memref, restrict=True, writable=True
         )
-        self.kinds.append("fa")
+        self.kinds.append("fused_attention")
 
     # ---- fused grouped-query attention(rms_f32 (T,C) f32) -> (T,C) f16 ----
     # Emits non-causal linalg; the causal mask (if enabled) is injected later by
@@ -446,12 +453,14 @@ class Builder:
         hs = C // H
         n_rep = H // n_kv  # query heads sharing each KV head
         kv_dim = n_kv * hs  # narrow K/V feature width (GQA: kv_dim <= C)
-        x16 = self.cast_f16(x, T, C)  # ew
+        x16 = self.cast_f16(x, T, C)  # elementwise
         qp = self._buf((T, C), self.f32)
-        self.matmul(x16, wq, T, C, out_buf=qp)  # mm -> f32 q projection
-        qbuf = self.cast_f16_buf(self.rope(qp, cos, sin, T, C, H), T, C)  # ew(rope), ew
+        self.matmul(x16, wq, T, C, out_buf=qp)  # matmul -> f32 q projection
+        qbuf = self.cast_f16_buf(
+            self.rope(qp, cos, sin, T, C, H), T, C
+        )  # rope, elementwise
         kp = self._buf((T, kv_dim), self.f32)
-        self.matmul(x16, wk, T, kv_dim, out_buf=kp)  # mm -> f32 k projection
+        self.matmul(x16, wk, T, kv_dim, out_buf=kp)  # matmul -> f32 k projection
         kbuf = self.cast_f16_buf(
             self.rope(kp, cos, sin, T, kv_dim, n_kv), T, kv_dim
         )  # ew(rope), ew
@@ -479,22 +488,22 @@ class Builder:
 def _emit_block_llama(bld, x, w, cos, sin, T, C, hidden, H, n_kv, eps, out_buf=None):
     """Emit one Llama transformer block (fused GQA + RoPE, no bias; causal
     masking, if any, is applied by the schedule's fused-attention transform).
-    `w` weight keys: an (attention RMSNorm weight), wq,wk,wv, wo,
-    fn (ffn RMSNorm weight), w1,w2,w3.  wk/wv are narrow (C, n_kv*hs) for GQA.
+    `w` weight keys: attn_norm (attention RMSNorm weight), wq,wk,wv, wo,
+    ffn_norm (ffn RMSNorm weight), w1,w2,w3.  wk/wv are narrow (C, n_kv*hs) for GQA.
     cos/sin are the shared (T, hs/2) RoPE tables.
         h   = x + wo( GQA( RoPE(rms_attn(x)) ) )  # attention sublayer + residual
         out = h + swiglu( rms_ffn(h) )            # FFN sublayer + residual
     SwiGLU: w2( silu(z@w1) * (z@w3) ).
     """
     # ---- attention sublayer: h = x + wo(GQA(RoPE(rms(x)))) ----
-    rms1 = bld.rmsnorm(x, w["an"], T, C, eps)
+    rms1 = bld.rmsnorm(x, w["attn_norm"], T, C, eps)
     attn16 = bld.fused_attention(
         rms1, w["wq"], w["wk"], w["wv"], cos, sin, T, C, H, n_kv
     )  # f16 (T,C)
     proj = bld.matmul(attn16, w["wo"], T, C)  # (T,C) f32, no bias
     h = bld.add(x, proj, T, C)
     # ---- FFN sublayer: out = h + swiglu(rms(h)) ----
-    rms2 = bld.rmsnorm(h, w["fn"], T, C, eps)
+    rms2 = bld.rmsnorm(h, w["ffn_norm"], T, C, eps)
     z16 = bld.cast_f16(rms2, T, C)
     gate = bld.matmul(z16, w["w1"], T, hidden)  # z@w1 -> (T,hidden) f32
     gate = bld.silu(gate, T, hidden)  # silu(z@w1)
@@ -543,7 +552,7 @@ def build_llama_payload(func_name, T, C, hidden, vocab, n_layers, H, n_kv, eps=1
             cos, sin = args[2], args[3]  # raw memrefs (rope views them itself)
             idx = 4
             layer_w = []
-            keys = ["an", "wq", "wk", "wv", "wo", "fn", "w1", "w2", "w3"]
+            keys = ["attn_norm", "wq", "wk", "wv", "wo", "ffn_norm", "w1", "w2", "w3"]
             for _ in range(n_layers):
                 w = {
                     k: emit_buf_to_tensor(args[idx + i], restrict=True)
