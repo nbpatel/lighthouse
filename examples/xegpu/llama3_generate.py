@@ -98,7 +98,7 @@ def main():
 
     # ---- XeGPU tiling params (same structure as llama3.py) ----
     param_selector = XeGPUParameterSelector()
-    mm_params = dict(param_selector.get_parameters((T, C, C)))
+    mm_params = param_selector.get_parameters_dict((T, C, C))
     mm_params["gpu_specs"] = param_selector.gpu_specs
     ln_params = {"wg_rows": 64, "sg_rows": 8, "subgroup_size": 16,
                  "reduction_step_size": 16, "T": T}
@@ -116,7 +116,7 @@ def main():
         shape_params = {}
         for shp in mm_shapes:
             if shp not in shape_params:
-                p = dict(param_selector.get_parameters(shp))
+                p = param_selector.get_parameters_dict(shp)
                 p["gpu_specs"] = param_selector.gpu_specs
                 shape_params[shp] = p
         mm_params_list = [dict(shape_params[shp]) for shp in mm_shapes]
