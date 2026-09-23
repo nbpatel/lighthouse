@@ -305,6 +305,38 @@ def run_toy(args):
         print("PASSED" if rel < 5e-2 else "FAILED")
 
 
+def _chat_loop(tok, forward, T, max_new):
+    """Interactive REPL: read a prompt, greedily complete it, print the result.
+
+    Base completion model (not instruct-tuned): it continues the text rather than
+    holding a conversation, and each turn is independent (fixed compiled T, no KV
+    cache, no history).
+    """
+    n_new = max_new if max_new > 0 else 20
+    print("\n=== interactive (base completion model; blank line or Ctrl-D quits) ===")
+    while True:
+        try:
+            prompt = input("\nyou> ").strip()
+        except EOFError:
+            print()
+            break
+        if not prompt:
+            break
+        ids = tok(prompt, return_tensors="np")["input_ids"][0].astype(np.int64)
+        if len(ids) > T:
+            ids = ids[:T]
+        seq = list(ids)
+        start = len(seq)
+        for _ in range(n_new):
+            if len(seq) >= T:
+                break
+            nxt = int(forward(np.array(seq, np.int64), len(seq)).argmax())
+            if tok.eos_token_id is not None and nxt == tok.eos_token_id:
+                break
+            seq.append(nxt)
+        print(f"model> {tok.decode(seq[start:]).strip()}")
+
+
 # =============================================================================
 # REAL MODE -- load a HuggingFace checkpoint, tokenize a prompt, predict tokens.
 # =============================================================================
@@ -397,6 +429,10 @@ def run_real(args):
             )
             return out[n - 1].copy()
 
+        if args.chat:
+            _chat_loop(tok, forward, T, args.max_new_tokens)
+            return
+
         # ---- single next token: report top-5 ----
         last = forward(ids, n_tok)
         top = np.argsort(last)[::-1][:5]
@@ -464,6 +500,11 @@ def main():
         default=0,
         help="(real mode) if >0, greedily generate this many tokens (re-run the "
         "forward per step, no KV cache). 0 = just report the next token.",
+    )
+    parser.add_argument(
+        "--chat",
+        action="store_true",
+        help="(real mode) interactive REPL: compile once, then read prompts in a loop.",
     )
     parser.add_argument(
         "--vocab-cap",
