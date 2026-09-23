@@ -38,30 +38,66 @@ def main():
     # The checkpoint is NOT shipped with the repo (gated model, ~2.4 GB). Download it
     # first (e.g. `huggingface-cli download meta-llama/Llama-3.2-1B --local-dir <dir>`)
     # and point --model at that directory.
-    parser.add_argument("--model", default="../../models/llama-3.2-1b",
-                        help="Path to the HF checkpoint directory.")
-    parser.add_argument("--prompt", default="The capital of France is",
-                        help="Text prompt to run the forward pass on.")
-    parser.add_argument("--n-layers", type=int, default=None,
-                        help="Truncate to the first N transformer blocks (default: all).")
-    parser.add_argument("--seq-len", type=int, default=None,
-                        help="Compiled sequence length T (default: padded token count).")
-    parser.add_argument("--max-new-tokens", type=int, default=0,
-                        help="If >0, greedily generate this many tokens (re-run the "
-                             "forward per step, append argmax). 0 = just report the "
-                             "single next token (default).")
-    parser.add_argument("--vocab-cap", type=int, default=None,
-                        help="DIAGNOSTIC: shrink the output (lm_head) width to this many "
-                             "columns. Transformer block + embeddings stay full-width; "
-                             "only the final logits are truncated. Isolates whether the "
-                             "128256-wide output matmul is what crashes binary codegen.")
-    parser.add_argument("--no-causal", action="store_true",
-                        help="Disable causal masking.")
-    parser.add_argument("--dump", type=str, default=None,
-                        choices=["initial", "schedule", "tiled", "vectorized",
-                                 "bufferized", "inner-tiled", "gpu-outlining",
-                                 "xegpu-initial", "xegpu-wg", "final"],
-                        help="Print the IR at the given stage and exit.")
+    parser.add_argument(
+        "--model",
+        default="../../models/llama-3.2-1b",
+        help="Path to the HF checkpoint directory.",
+    )
+    parser.add_argument(
+        "--prompt",
+        default="The capital of France is",
+        help="Text prompt to run the forward pass on.",
+    )
+    parser.add_argument(
+        "--n-layers",
+        type=int,
+        default=None,
+        help="Truncate to the first N transformer blocks (default: all).",
+    )
+    parser.add_argument(
+        "--seq-len",
+        type=int,
+        default=None,
+        help="Compiled sequence length T (default: padded token count).",
+    )
+    parser.add_argument(
+        "--max-new-tokens",
+        type=int,
+        default=0,
+        help="If >0, greedily generate this many tokens (re-run the "
+        "forward per step, append argmax). 0 = just report the "
+        "single next token (default).",
+    )
+    parser.add_argument(
+        "--vocab-cap",
+        type=int,
+        default=None,
+        help="DIAGNOSTIC: shrink the output (lm_head) width to this many "
+        "columns. Transformer block + embeddings stay full-width; "
+        "only the final logits are truncated. Isolates whether the "
+        "128256-wide output matmul is what crashes binary codegen.",
+    )
+    parser.add_argument(
+        "--no-causal", action="store_true", help="Disable causal masking."
+    )
+    parser.add_argument(
+        "--dump",
+        type=str,
+        default=None,
+        choices=[
+            "initial",
+            "schedule",
+            "tiled",
+            "vectorized",
+            "bufferized",
+            "inner-tiled",
+            "gpu-outlining",
+            "xegpu-initial",
+            "xegpu-wg",
+            "final",
+        ],
+        help="Print the IR at the given stage and exit.",
+    )
     args = parser.parse_args()
     causal = not args.no_causal
 
@@ -81,6 +117,7 @@ def main():
     eps = cfg["rms_norm_eps"]
 
     from transformers import AutoTokenizer
+
     tok = AutoTokenizer.from_pretrained(args.model)
     ids = tok(args.prompt, return_tensors="np")["input_ids"][0].astype(np.int64)
     n_tok = len(ids)
@@ -88,8 +125,10 @@ def main():
     if n_tok > T:
         ids = ids[:T]
         n_tok = T
-    print(f"prompt {args.prompt!r} -> {n_tok} tokens; T={T}, C={C}, H={H}, n_kv={n_kv}, "
-          f"hidden={hidden}, vocab={vocab}, n_layers={n_layers}")
+    print(
+        f"prompt {args.prompt!r} -> {n_tok} tokens; T={T}, C={C}, H={H}, n_kv={n_kv}, "
+        f"hidden={hidden}, vocab={vocab}, n_layers={n_layers}"
+    )
 
     # host embedding lookup: x[t] = embed_tokens[ids[t]]. Rows past the prompt (pad)
     # are zeros; with causal masking they don't affect the prompt positions' logits.
@@ -103,18 +142,34 @@ def main():
     param_selector = XeGPUParameterSelector()
     mm_params = param_selector.get_parameters_dict((T, C, C))
     mm_params["gpu_specs"] = param_selector.gpu_specs
-    ln_params = {"wg_rows": 64, "sg_rows": 8, "subgroup_size": 16,
-                 "reduction_step_size": 16, "T": T}
-    fa_params = {"batch_size": 1, "num_heads": H, "n_ctx": T, "n_head": hs,
-                 "wg_rows": 128, "sg_rows": 16, "subgroup_size": 16,
-                 "inner_loop_tile_size": 64, "causal": causal}
+    ln_params = {
+        "wg_rows": 64,
+        "sg_rows": 8,
+        "subgroup_size": 16,
+        "reduction_step_size": 16,
+        "T": T,
+    }
+    fa_params = {
+        "batch_size": 1,
+        "num_heads": H,
+        "n_ctx": T,
+        "n_head": hs,
+        "wg_rows": 128,
+        "sg_rows": 16,
+        "subgroup_size": 16,
+        "inner_loop_tile_size": 64,
+        "causal": causal,
+    }
 
     with ir.Context(), ir.Location.unknown():
         lh_dialects.register_and_load()
         mod, kinds, mm_shapes = build_llama_payload(
-            "payload", T, C, hidden, vocab, n_layers, H, n_kv, eps=eps)
+            "payload", T, C, hidden, vocab, n_layers, H, n_kv, eps=eps
+        )
         if args.dump == "initial":
-            print(mod); print("KINDS:", kinds); return
+            print(mod)
+            print("KINDS:", kinds)
+            return
 
         shape_params = {}
         for shp in mm_shapes:
@@ -125,22 +180,31 @@ def main():
         mm_params_list = [dict(shape_params[shp]) for shp in mm_shapes]
 
         sched = build_combined_schedule(
-            dict(mm_params), dict(ln_params), kinds,
-            stop_at_stage=(args.dump or ""), fa_params=dict(fa_params),
-            mm_params_list=mm_params_list)
+            dict(mm_params),
+            dict(ln_params),
+            kinds,
+            stop_at_stage=(args.dump or ""),
+            fa_params=dict(fa_params),
+            mm_params_list=mm_params_list,
+        )
         if args.dump == "schedule":
-            print(sched); return
+            print(sched)
+            return
         schedules = [sched]
         if not args.dump or args.dump == "final":
             schedules.append(xegpu_to_binary())
         payload = TransformDriver(schedules).apply(mod)
         if args.dump:
-            print(payload); return
+            print(payload)
+            return
         print(f"LOWERED OK: 'llama' to {len(kinds)} kernels in one module")
 
         # ---- run on the GPU ----
-        runner = Runner(payload, mem_manager_cls=GPUMemoryManager,
-                        shared_libs=["libmlir_levelzero_runtime.so"])
+        runner = Runner(
+            payload,
+            mem_manager_cls=GPUMemoryManager,
+            shared_libs=["libmlir_levelzero_runtime.so"],
+        )
         out = np.zeros((T, vocab), np.float32)
         cb = Runner.get_gpu_argument_access_callback(out, arg_index=0)
         # arg order matches build_llama_payload: out, x, cos, sin, then per layer
@@ -149,8 +213,17 @@ def main():
         # so we build `host` once and just overwrite host[1] each step.
         host = [x, cos, sin]
         for lw in W["layers"]:
-            host += [lw["an"], lw["wq"], lw["wk"], lw["wv"], lw["wo"],
-                     lw["fn"], lw["w1"], lw["w2"], lw["w3"]]
+            host += [
+                lw["an"],
+                lw["wq"],
+                lw["wk"],
+                lw["wv"],
+                lw["wo"],
+                lw["fn"],
+                lw["w1"],
+                lw["w2"],
+                lw["w3"],
+            ]
         host += [W["fn_w"], W["lmw"]]
 
         def forward(seq_ids, n):
@@ -158,9 +231,11 @@ def main():
             return the logits row at the last real position (n-1)."""
             xb = np.zeros((T, C), np.float32)
             xb[:n] = W["embeddings"][seq_ids[:n]]
-            runner.execute(host_input_buffers=[out, xb] + host[1:],
-                           payload_function_name="payload",
-                           argument_access_callback=cb)
+            runner.execute(
+                host_input_buffers=[out, xb] + host[1:],
+                payload_function_name="payload",
+                argument_access_callback=cb,
+            )
             return out[n - 1].copy()
 
         # ---- single next token: report top-5 ----
@@ -170,8 +245,10 @@ def main():
         print("top-5 next tokens (GPU):")
         for i in top:
             print(f"  {int(i):7d}  {tok.decode([int(i)])!r:20s} logit={last[i]:.3f}")
-        print(f"argmax next token id: {int(last.argmax())}  "
-              f"-> {tok.decode([int(last.argmax())])!r}")
+        print(
+            f"argmax next token id: {int(last.argmax())}  "
+            f"-> {tok.decode([int(last.argmax())])!r}"
+        )
 
         # ---- optional greedy generation loop (re-run forward per token, no KV cache) ----
         if args.max_new_tokens > 0:

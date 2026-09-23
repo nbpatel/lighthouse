@@ -75,7 +75,9 @@ def rope_tables_from_config(cfg, T):
         high_freq_wavelen = old_ctx / high_freq_factor
         wavelen = 2.0 * np.pi / inv_freq
         # low-freq (wavelen > low_freq_wavelen): divide by factor; high-freq: keep.
-        inv_freq_llama = np.where(wavelen > low_freq_wavelen, inv_freq / factor, inv_freq)
+        inv_freq_llama = np.where(
+            wavelen > low_freq_wavelen, inv_freq / factor, inv_freq
+        )
         # medium band: smooth interpolation between the scaled and unscaled freqs.
         smooth = (old_ctx / wavelen - low_freq_factor) / (
             high_freq_factor - low_freq_factor
