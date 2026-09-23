@@ -3,8 +3,8 @@
 
 """Llama-3 forward pass on the Intel GPU (XeGPU) -- the DRIVER ("run it").
 
-Runs a Llama-3 transformer forward/inference as one MLIR module lowered to many
-separate un-fused XeGPU kernels with on-device handoff. Llama building blocks:
+Runs a Llama-3 transformer forward as one MLIR module lowered to many separate
+un-fused XeGPU kernels with on-device handoff. Llama building blocks:
 
   * RMSNorm
   * SwiGLU FFN     w2( silu(z @ w1) * (z @ w3) )
@@ -12,16 +12,18 @@ separate un-fused XeGPU kernels with on-device handoff. Llama building blocks:
     --no-causal to disable), with RoPE applied to q/k
   * no biases (Llama uses bias=False on every Linear)
 
-Each transformer block is
-    h   = x + wo( MHA( rms_attn(x) ) )       # attention sublayer
-    out = h + swiglu( rms_ffn(h) )           # MLP sublayer
-and the full model is
-    x = tok_embeddings(tokens)         # embeddings done host-side
-    for _ in range(n_layers): x = Block(x)
-    x = rms_final(x); logits = x @ output_weight
+Two modes, same payload + schedule underneath:
 
-Config: n_layers=6, dim=256, n_heads=4 (head_dim=64), hidden=1024, vocab=256,
-seq_len=256.
+  * default (no --model): TOY self-check. Random weights, small dims
+    (T=256, C=256, H=4, n_kv=2, hidden=1024, vocab=256); `--check` runs on the GPU
+    and compares against a plain-numpy reference. Needs only numpy -- this is the
+    CI-friendly path (see the RUN line above).
+  * --model PATH: REAL inference. Loads a HuggingFace Llama-3.2 checkpoint, tokenizes
+    --prompt, runs the forward, and reports the predicted next token(s). Needs
+    transformers + safetensors + the checkpoint on disk (see --model).
+
+Both reuse the same payload (llama3_payload.build_llama_payload) and schedule
+(llama3_schedule.build_combined_schedule); only dims/weights/input differ.
 
 Three-stage organization (compiling a model to the GPU here):
   1. Payload  ("what to compute") -> examples/xegpu/llama3_payload.py
@@ -29,8 +31,10 @@ Three-stage organization (compiling a model to the GPU here):
   3. Driver   ("run it")           -> this file.
 
 Run:
-  .venv/bin/python examples/xegpu/llama3.py [--n-layers N] [--check]
-  .venv/bin/python examples/xegpu/llama3.py [--dump STAGE]
+  .venv/bin/python examples/xegpu/llama3.py [--n-layers N] [--check]   # toy self-check
+  .venv/bin/python examples/xegpu/llama3.py --dump STAGE               # dump IR and exit
+  .venv/bin/python examples/xegpu/llama3.py --model <ckpt> --seq-len 256 \
+      --prompt "The capital of France is"                             # real inference
 """
 
 import argparse
@@ -144,72 +148,15 @@ def numpy_ref_llama(x, layer_w, fn_w, lmw, cos, sin, H, n_kv, eps=1e-5, causal=F
     return _numpy_f16(hf) @ lmw.astype(np.float32)
 
 
-def main():
-    """Entry point. Builds the full Llama model (n_layers blocks -> rms_final ->
-    output), with flash grouped-query attention (RoPE, causal) per block.
+# =============================================================================
+# SHARED LOWERING -- build the payload + schedule and lower to a GPU binary.
+# =============================================================================
+def _lower_payload(T, C, hidden, vocab, n_layers, H, n_kv, hs, eps, causal, dump):
+    """Build the payload + combined schedule and lower it to a GPU-binary module.
 
-    Flow: build payload module -> build combined schedule (which folds in the
-    fused attention rewrite) -> TransformDriver lowers it to XeGPU + xegpu_to_binary
-    makes the GPU binary -> Runner JIT-runs it -> compare to the numpy reference.
+    Must be called inside an ``ir.Context``. Returns ``(payload, kinds)``, or ``None``
+    when a ``--dump`` stage was printed (the caller should just return).
     """
-    parser = argparse.ArgumentParser(
-        description="Llama-3-style forward pass on the Intel GPU (XeGPU).",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-    )
-    parser.add_argument(
-        "--n-layers",
-        type=int,
-        default=1,
-        help="Number of transformer layers (the full model uses 6).",
-    )
-    parser.add_argument(
-        "--no-causal",
-        action="store_true",
-        help="Disable causal masking (run non-causal attention).",
-    )
-    parser.add_argument(
-        "--check",
-        action="store_true",
-        help="Run on the GPU and compare the result against the numpy reference.",
-    )
-    parser.add_argument(
-        "--dump",
-        type=str,
-        default=None,
-        choices=[
-            "initial",
-            "schedule",
-            "tiled",
-            "vectorized",
-            "bufferized",
-            "inner-tiled",
-            "gpu-outlining",
-            "xegpu-initial",
-            "xegpu-wg",
-            "final",
-        ],
-        help="Print the IR at the given stage and exit.",
-    )
-    args = parser.parse_args()
-    dump = args.dump
-    check = args.check
-    n_layers = args.n_layers
-    causal = not args.no_causal  # Llama-3 is autoregressive/causal
-
-    # Kernel-friendly shapes: T=dim=256 (q/k/v/proj matmuls), hidden=1024,
-    # vocab=256. Multi-head: H heads of head_size=dim/H=64. GQA: n_kv KV heads
-    # (n_kv <= H, H % n_kv == 0); each query head reads KV head h // (H//n_kv).
-    T, C, hidden = 256, 256, 1024
-    vocab = 256
-    H = 4  # attention (query) heads (hs = C/H = 64)
-    # KV heads for grouped-query attention: 1 < n_kv < H, and n_kv | H. Each query
-    # head reads KV head h // (H//n_kv). The degenerate ends -- n_kv == H (plain MHA,
-    # n_rep=1) and n_kv == 1 (multi-query) -- collapse a factored head dim to 1,
-    # which reshapes the fused-attention region so its QK^T/@V don't co-tile into one
-    # forall; use the plain-MHA example for n_kv == H.
-    n_kv = 2  # 2 query heads share each KV head (n_rep = H // n_kv = 2)
-    hs = C // H
-    kv_dim = n_kv * hs  # narrow K/V feature width
     param_selector = XeGPUParameterSelector()
     mm_params = param_selector.get_parameters_dict((T, C, C))
     mm_params["gpu_specs"] = param_selector.gpu_specs
@@ -224,7 +171,7 @@ def main():
         "batch_size": 1,
         "num_heads": H,
         "n_ctx": T,
-        "n_head": C // H,
+        "n_head": hs,
         "wg_rows": 128,
         "sg_rows": 16,
         "subgroup_size": 16,
@@ -232,48 +179,76 @@ def main():
         "causal": causal,
     }
 
+    mod, kinds, mm_shapes = build_llama_payload(
+        "payload", T, C, hidden, vocab, n_layers, H, n_kv, eps=eps
+    )
+    if dump == "initial":
+        print(mod)
+        print("KINDS:", kinds)
+        return None
+
+    # Per-matmul DPAS params: the K/V projections are narrow (N = n_kv*hs < C), so
+    # they need different wg_n/sg_n tiling than the wide matmuls. Select once per
+    # distinct (M,N,K) shape (the selector reads the tuple as (M,N,K)).
+    shape_params = {}
+    for shp in mm_shapes:
+        if shp not in shape_params:
+            p = param_selector.get_parameters_dict(shp)
+            p["gpu_specs"] = param_selector.gpu_specs
+            shape_params[shp] = p
+    mm_params_list = [dict(shape_params[shp]) for shp in mm_shapes]
+
+    sched = build_combined_schedule(
+        dict(mm_params),
+        dict(ln_params),
+        kinds,
+        stop_at_stage=(dump or ""),
+        fa_params=dict(fa_params),
+        mm_params_list=mm_params_list,
+    )
+    if dump == "schedule":
+        print(sched)
+        return None
+    schedules = [sched]
+    if not dump or dump == "final":
+        schedules.append(xegpu_to_binary())
+    payload = TransformDriver(schedules).apply(mod)
+    if dump:
+        print(payload)
+        return None
+    print(f"LOWERED OK: 'llama' to {len(kinds)} kernels in one module")
+    return payload, kinds
+
+
+# =============================================================================
+# TOY MODE -- random weights, self-check against the numpy reference (CI path).
+# =============================================================================
+def run_toy(args):
+    """Random-weights forward, optionally checked against the numpy reference."""
+    causal = not args.no_causal  # Llama-3 is autoregressive/causal
+    n_layers = args.n_layers if args.n_layers is not None else 1
+    eps = 1e-5
+
+    # Kernel-friendly shapes: T=dim=256 (q/k/v/proj matmuls), hidden=1024,
+    # vocab=256. Multi-head: H heads of head_size=dim/H=64. GQA: n_kv KV heads
+    # (n_kv <= H, H % n_kv == 0); each query head reads KV head h // (H//n_kv).
+    T, C, hidden = 256, 256, 1024
+    vocab = 256
+    H = 4  # attention (query) heads (hs = C/H = 64)
+    n_kv = 2  # 2 query heads share each KV head (n_rep = H // n_kv = 2)
+    hs = C // H
+    kv_dim = n_kv * hs  # narrow K/V feature width
+
     with ir.Context(), ir.Location.unknown():
         lh_dialects.register_and_load()
-        mod, kinds, mm_shapes = build_llama_payload(
-            "payload", T, C, hidden, vocab, n_layers, H, n_kv
+        lowered = _lower_payload(
+            T, C, hidden, vocab, n_layers, H, n_kv, hs, eps, causal, args.dump
         )
-        if dump == "initial":
-            print(mod)
-            print("KINDS:", kinds)
+        if lowered is None:
             return
+        payload, kinds = lowered
 
-        # Per-matmul DPAS params: the K/V projections are narrow (N = n_kv*hs < C),
-        # so they need different wg_n/sg_n tiling than the wide matmuls. Select once
-        # per distinct (M,N,K) shape (the selector reads the tuple as (M,N,K)).
-        shape_params = {}
-        for shp in mm_shapes:
-            if shp not in shape_params:
-                p = param_selector.get_parameters_dict(shp)
-                p["gpu_specs"] = param_selector.gpu_specs
-                shape_params[shp] = p
-        mm_params_list = [dict(shape_params[shp]) for shp in mm_shapes]
-
-        sched = build_combined_schedule(
-            dict(mm_params),
-            dict(ln_params),
-            kinds,
-            stop_at_stage=(dump or ""),
-            fa_params=dict(fa_params),
-            mm_params_list=mm_params_list,
-        )
-        if dump == "schedule":
-            print(sched)
-            return
-        schedules = [sched]
-        if not dump or dump == "final":
-            schedules.append(xegpu_to_binary())
-        payload = TransformDriver(schedules).apply(mod)
-        if dump:
-            print(payload)
-            return
-        print(f"LOWERED OK: 'llama' to {len(kinds)} kernels in one module")
-
-        if not check:
+        if not args.check:
             return
         runner = Runner(
             payload,
@@ -287,9 +262,8 @@ def main():
 
         # host "embeddings": simulate tok_embeddings(tokens) as the input x.
         x = (np.random.randn(T, C) * 0.5).astype(np.float32)
-        cos, sin = _numpy_rope_tables(
-            T, hs
-        )  # RoPE (T, hs/2) tables, shared across layers
+        # RoPE (T, hs/2) tables, shared across layers.
+        cos, sin = _numpy_rope_tables(T, hs)
         layers = []
         host = [out, x, cos, sin]  # matches payload arg order: out, x, cos, sin, ...
         for _ in range(n_layers):
@@ -329,6 +303,204 @@ def main():
         rel = np.abs(out - ref).max() / (np.abs(ref).max() + 1e-6)
         print(f"max abs diff={np.abs(out - ref).max():.4f}  rel={rel:.6f}")
         print("PASSED" if rel < 5e-2 else "FAILED")
+
+
+# =============================================================================
+# REAL MODE -- load a HuggingFace checkpoint, tokenize a prompt, predict tokens.
+# =============================================================================
+def run_real(args):
+    """Real HuggingFace weights: tokenize --prompt, run the forward, report tokens."""
+    # Imported here so the toy/CI path never needs safetensors / the checkpoint.
+    from llama3_weights import load_llama_weights, rope_tables_from_config
+
+    W = load_llama_weights(args.model, n_layers=args.n_layers)
+    cfg = W["cfg"]
+    C = cfg["hidden_size"]
+    H = cfg["num_attention_heads"]
+    n_kv = cfg["num_key_value_heads"]
+    hidden = cfg["intermediate_size"]
+    vocab = cfg["vocab_size"]
+    if args.vocab_cap:  # diagnostic: truncate only the output width
+        vocab = args.vocab_cap
+        W["lmw"] = np.ascontiguousarray(W["lmw"][:, :vocab])
+    hs = cfg["head_dim"]
+    n_layers = len(W["layers"])
+    eps = cfg["rms_norm_eps"]
+    causal = not args.no_causal
+
+    from transformers import AutoTokenizer
+
+    tok = AutoTokenizer.from_pretrained(args.model)
+    ids = tok(args.prompt, return_tensors="np")["input_ids"][0].astype(np.int64)
+    n_tok = len(ids)
+    T = args.seq_len if args.seq_len else n_tok
+    if n_tok > T:
+        ids = ids[:T]
+        n_tok = T
+    print(
+        f"prompt {args.prompt!r} -> {n_tok} tokens; T={T}, C={C}, H={H}, n_kv={n_kv}, "
+        f"hidden={hidden}, vocab={vocab}, n_layers={n_layers}"
+    )
+
+    # host embedding lookup: x[t] = embed_tokens[ids[t]]. Rows past the prompt (pad)
+    # are zeros; with causal masking they don't affect the prompt positions' logits.
+    x = np.zeros((T, C), np.float32)
+    x[:n_tok] = W["embeddings"][ids]
+
+    # RoPE tables from the real config (theta=500000 + llama3 NTK scaling).
+    cos, sin = rope_tables_from_config(cfg, T)
+
+    with ir.Context(), ir.Location.unknown():
+        lh_dialects.register_and_load()
+        lowered = _lower_payload(
+            T, C, hidden, vocab, n_layers, H, n_kv, hs, eps, causal, args.dump
+        )
+        if lowered is None:
+            return
+        payload, kinds = lowered
+
+        runner = Runner(
+            payload,
+            mem_manager_cls=GPUMemoryManager,
+            shared_libs=["libmlir_levelzero_runtime.so"],
+        )
+        out = np.zeros((T, vocab), np.float32)
+        cb = Runner.get_gpu_argument_access_callback(out, arg_index=0)
+        # arg order matches build_llama_payload: out, x, cos, sin, then per layer
+        # [an,wq,wk,wv,wo,fn,w1,w2,w3], then final [fn_w, lmw]. Weights/cos/sin are
+        # fixed across generation steps; only `x` (the embedded sequence) changes,
+        # so we build `host` once and just overwrite host[1] each step.
+        host = [x, cos, sin]
+        for lw in W["layers"]:
+            host += [
+                lw["an"],
+                lw["wq"],
+                lw["wk"],
+                lw["wv"],
+                lw["wo"],
+                lw["fn"],
+                lw["w1"],
+                lw["w2"],
+                lw["w3"],
+            ]
+        host += [W["fn_w"], W["lmw"]]
+
+        def forward(seq_ids, n):
+            """Embed the first `n` tokens of seq_ids into x, run the GPU forward,
+            return the logits row at the last real position (n-1)."""
+            xb = np.zeros((T, C), np.float32)
+            xb[:n] = W["embeddings"][seq_ids[:n]]
+            runner.execute(
+                host_input_buffers=[out, xb] + host[1:],
+                payload_function_name="payload",
+                argument_access_callback=cb,
+            )
+            return out[n - 1].copy()
+
+        # ---- single next token: report top-5 ----
+        last = forward(ids, n_tok)
+        top = np.argsort(last)[::-1][:5]
+        print(f"\nprompt: {args.prompt!r}")
+        print("top-5 next tokens (GPU):")
+        for i in top:
+            print(f"  {int(i):7d}  {tok.decode([int(i)])!r:20s} logit={last[i]:.3f}")
+        print(
+            f"argmax next token id: {int(last.argmax())}  "
+            f"-> {tok.decode([int(last.argmax())])!r}"
+        )
+
+        # ---- optional greedy generation loop (re-run forward per token, no KV cache) ----
+        if args.max_new_tokens > 0:
+            seq = list(ids)
+            for _ in range(args.max_new_tokens):
+                if len(seq) >= T:
+                    print(f"[stop: sequence reached compiled T={T}]")
+                    break
+                logits = forward(np.array(seq, np.int64), len(seq))
+                seq.append(int(logits.argmax()))
+            print(f"\ngenerated ({len(seq) - n_tok} new tokens):")
+            print(tok.decode(seq))
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Llama-3 forward pass on the Intel GPU (XeGPU).",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    # --model selects REAL inference; omit it for the toy random-weights self-check.
+    # The checkpoint is NOT shipped with the repo (gated model, ~2.4 GB); download it
+    # first (e.g. `huggingface-cli download meta-llama/Llama-3.2-1B --local-dir <dir>`)
+    # and point --model at that directory.
+    parser.add_argument(
+        "--model",
+        default=None,
+        help="HF checkpoint dir -> real inference. Omit for the toy self-check.",
+    )
+    parser.add_argument(
+        "--prompt",
+        default="The capital of France is",
+        help="(real mode) text prompt to run the forward pass on.",
+    )
+    parser.add_argument(
+        "--n-layers",
+        type=int,
+        default=None,
+        help="Truncate to the first N transformer blocks (toy default: 1; real: all).",
+    )
+    parser.add_argument(
+        "--seq-len",
+        type=int,
+        default=None,
+        help="(real mode) compiled sequence length T (default: padded token count).",
+    )
+    parser.add_argument(
+        "--check",
+        action="store_true",
+        help="(toy mode) run on the GPU and compare against the numpy reference.",
+    )
+    parser.add_argument(
+        "--max-new-tokens",
+        type=int,
+        default=0,
+        help="(real mode) if >0, greedily generate this many tokens (re-run the "
+        "forward per step, no KV cache). 0 = just report the next token.",
+    )
+    parser.add_argument(
+        "--vocab-cap",
+        type=int,
+        default=None,
+        help="(real mode) DIAGNOSTIC: shrink the output (lm_head) width to this many "
+        "columns; the transformer block + embeddings stay full-width.",
+    )
+    parser.add_argument(
+        "--no-causal",
+        action="store_true",
+        help="Disable causal masking (run non-causal attention).",
+    )
+    parser.add_argument(
+        "--dump",
+        type=str,
+        default=None,
+        choices=[
+            "initial",
+            "schedule",
+            "tiled",
+            "vectorized",
+            "bufferized",
+            "inner-tiled",
+            "gpu-outlining",
+            "xegpu-initial",
+            "xegpu-wg",
+            "final",
+        ],
+        help="Print the IR at the given stage and exit.",
+    )
+    args = parser.parse_args()
+
+    if args.model is not None:
+        run_real(args)
+    else:
+        run_toy(args)
 
 
 if __name__ == "__main__":
