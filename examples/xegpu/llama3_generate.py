@@ -35,6 +35,9 @@ def main():
         description="Llama-3.2 forward with real HF weights on the Intel GPU (XeGPU).",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
+    # The checkpoint is NOT shipped with the repo (gated model, ~2.4 GB). Download it
+    # first (e.g. `huggingface-cli download meta-llama/Llama-3.2-1B --local-dir <dir>`)
+    # and point --model at that directory.
     parser.add_argument("--model", default="../../models/llama-3.2-1b",
                         help="Path to the HF checkpoint directory.")
     parser.add_argument("--prompt", default="The capital of France is",
