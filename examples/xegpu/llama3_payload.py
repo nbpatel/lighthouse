@@ -68,7 +68,8 @@ class Builder:
     'rmsnorm_tensor'  = unmaterialized RMSNorm          -> fuse with following cast
       'fused_attention' = flash multi-head attention      -> one kernel (QK^T->softmax->@V,
                           online-softmax over K/V tiles; causal mask added by the schedule).
-      'rope'            = rotary position embedding       -> head-grid row-parallel kernel
+    'rope'            = head-major RoPE / conversion    -> head-grid row-parallel kernel
+    'rope_tensor'     = unmaterialized rotated halves   -> producer for fusion
       'elementwise'     = cast / silu / mul / residual    -> row-parallel kernel
             'elementwise_tensor' = unmaterialized generic      -> producer for fusion
         Tensor-only RMSNorm's cast inherits the reduction kernel's annotations.
@@ -252,8 +253,11 @@ class Builder:
             return None
         return emit_buf_to_tensor(buf, restrict=True)
 
-    def rope(self, src_buf, cos, sin, T, D, nh):
+    def rope(self, src_buf, cos, sin, T, D, nh, *, materialize=True):
         """RoPE (rotary position embedding), half-split -> (T,D) f32 buffer.
+
+        With materialize=False, return two FP32 (nh,T,hs/2) tensor results
+        for fusion into a separate head-major conversion by the schedule.
 
         Rotary embedding on a (T, D=nh*hs) f32 projection buffer, applied per head.
         HALF-SPLIT (GPT-NeoX / HF-Llama) convention: within each head's hs coords,
@@ -274,29 +278,19 @@ class Builder:
         f32 = self.f32
         hs = D // nh
         half = hs // 2
-        out_buf = self._buf((T, D), f32)
-        # view (T,D) buffers as (nh, T, hs) strided (head-outermost transpose view).
-        src3 = self._heads_view_of(src_buf, T, nh, hs)
-        out3 = self._heads_view_of(out_buf, T, nh, hs)
-        # (nh,T,hs) has strides [hs, D, 1]; split the last (hs) dim into two halves.
-        lo = ir.StridedLayoutAttr.get(0, [hs, D, 1])  # first half, offset 0
-        hi = ir.StridedLayoutAttr.get(half, [hs, D, 1])  # second half, offset half
-        t_lo = ir.MemRefType.get((nh, T, half), f32, layout=lo)
-        t_hi = ir.MemRefType.get((nh, T, half), f32, layout=hi)
-        s1 = memref.subview(src3, [0, 0, 0], [nh, T, half], [1, 1, 1], result_type=t_lo)
-        s2 = memref.subview(
-            src3, [0, 0, half], [nh, T, half], [1, 1, 1], result_type=t_hi
-        )
-        o1 = memref.subview(out3, [0, 0, 0], [nh, T, half], [1, 1, 1], result_type=t_lo)
-        o2 = memref.subview(
-            out3, [0, 0, half], [nh, T, half], [1, 1, 1], result_type=t_hi
-        )
+        out_buf = self._buf((T, D), f32) if materialize else None
+        s1, s2 = self._head_halves_of(src_buf, T, D, nh)
         s1t = emit_buf_to_tensor(s1, restrict=True)
         s2t = emit_buf_to_tensor(s2, restrict=True)
         cos_t = emit_buf_to_tensor(cos, restrict=True)
         sin_t = emit_buf_to_tensor(sin, restrict=True)
-        o1t = emit_buf_to_tensor(o1, restrict=True, writable=True)
-        o2t = emit_buf_to_tensor(o2, restrict=True, writable=True)
+        if materialize:
+            o1, o2 = self._head_halves_of(out_buf, T, D, nh)
+            o1t = emit_buf_to_tensor(o1, restrict=True, writable=True)
+            o2t = emit_buf_to_tensor(o2, restrict=True, writable=True)
+        else:
+            o1t = tensor.empty((nh, T, half), f32)
+            o2t = tensor.empty((nh, T, half), f32)
         d0, d1, d2 = (ir.AffineDimExpr.get(i) for i in range(3))
         idn = affine_map(3, [d0, d1, d2])  # (head, t, coord)
         csm = affine_map(3, [d1, d2])  # cos/sin indexed by (t, coord)
@@ -312,6 +306,9 @@ class Builder:
             r2 = arith.AddFOp(arith.MulFOp(b, co).result, arith.MulFOp(a, si).result)
             return r1.result, r2.result
 
+        if not materialize:
+            self.kinds.append("rope_tensor")
+            return rot
         bufferization.materialize_in_destination(
             None, rot[0], o1, restrict=True, writable=True
         )
@@ -320,6 +317,50 @@ class Builder:
         )
         self.kinds.append("rope")
         return emit_buf_to_tensor(out_buf, restrict=True)
+
+    def cast_head_halves_f16_buf(self, halves, T, D, nh):
+        """Convert two head-major tensor halves into one FP16 device buffer."""
+        buf = self._buf((T, D), self.f16)
+        destinations = self._head_halves_of(buf, T, D, nh)
+        outputs = [
+            emit_buf_to_tensor(destination, restrict=True, writable=True)
+            for destination in destinations
+        ]
+        identity = self._par(rank=3)
+
+        @linalg.generic(list(halves), outputs, [identity] * 4, [parallel] * 3)
+        def convert(first, second, _first_output, _second_output):
+            return arith.TruncFOp(self.f16, first).result, arith.TruncFOp(
+                self.f16, second
+            ).result
+
+        for result, destination in zip(convert, destinations):
+            bufferization.materialize_in_destination(
+                None, result, destination, restrict=True, writable=True
+            )
+        self.kinds.append("rope")
+        return buf
+
+    def _head_halves_of(self, buf, T, D, nh):
+        """Strided views of the low/high halves, preserving the buffer dtype."""
+        hs = D // nh
+        half = hs // 2
+        heads = self._heads_view_of(buf, T, nh, hs)
+        element_type = buf.type.element_type
+        views = []
+        for offset in (0, half):
+            layout = ir.StridedLayoutAttr.get(offset, [hs, D, 1])
+            result_type = ir.MemRefType.get((nh, T, half), element_type, layout=layout)
+            views.append(
+                memref.subview(
+                    heads,
+                    [0, 0, offset],
+                    [nh, T, half],
+                    [1, 1, 1],
+                    result_type=result_type,
+                )
+            )
+        return views
 
     def cast_f16_buf(self, x, T, C):
         """Cast f32 (T,C) -> f16 (T,C), returning the MEMREF buffer (for views)."""
@@ -485,14 +526,12 @@ class Builder:
         x16 = self.cast_f16(x, T, C)  # elementwise
         qp = self._buf((T, C), self.f32)
         self.matmul(x16, wq, T, C, out_buf=qp)  # matmul -> f32 q projection
-        qbuf = self.cast_f16_buf(
-            self.rope(qp, cos, sin, T, C, H), T, C
-        )  # rope, elementwise
+        q_halves = self.rope(qp, cos, sin, T, C, H, materialize=False)
+        qbuf = self.cast_head_halves_f16_buf(q_halves, T, C, H)
         kp = self._buf((T, kv_dim), self.f32)
         self.matmul(x16, wk, T, kv_dim, out_buf=kp)  # matmul -> f32 k projection
-        kbuf = self.cast_f16_buf(
-            self.rope(kp, cos, sin, T, kv_dim, n_kv), T, kv_dim
-        )  # ew(rope), ew
+        k_halves = self.rope(kp, cos, sin, T, kv_dim, n_kv, materialize=False)
+        kbuf = self.cast_head_halves_f16_buf(k_halves, T, kv_dim, n_kv)
         vbuf = self.cast_f16_buf(self.matmul(x16, wv, T, kv_dim), T, kv_dim)  # mm, ew
         Qh = self.grouped_heads_view(qbuf, T, n_kv, n_rep, hs)  # (n_kv,n_rep,T,hs)
         Kh = self.heads_view(kbuf, T, n_kv, hs)  # (n_kv,T,hs) strided view

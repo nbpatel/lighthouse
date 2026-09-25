@@ -396,10 +396,11 @@ def _bundle(
     rss = ln_params["reduction_step_size"]
     wg_rows = ln_params["wg_rows"]
     nkernels = sum(
-        kind not in {"elementwise_tensor", "rmsnorm_tensor"} for kind in kinds
+        kind not in {"elementwise_tensor", "rmsnorm_tensor", "rope_tensor"}
+        for kind in kinds
     )
     n_fa = kinds.count("fused_attention")
-    n_rope = kinds.count("rope")
+    n_rope = kinds.count("rope") + kinds.count("rope_tensor")
     if mm_params_list is None:
         mm_params_list = [mm_params] * n_mm
 
@@ -449,6 +450,8 @@ def _bundle(
             gi += 1
         elif k == "elementwise_tensor":
             gi += 1
+        elif k == "rope_tensor":
+            gi += 1
         elif k == "rope":
             rope_handles.append(gen_handles[gi])
             gi += 1
@@ -456,7 +459,7 @@ def _bundle(
             fa_slices.append((gen_handles[gi], gen_handles[gi + 1]))
             gi += 2
         # matmul contributes no bare linalg.generic here
-        if k != "elementwise_tensor":
+        if k not in {"elementwise_tensor", "rope_tensor"}:
             kernel_kinds.append(k)
 
     kinds = kernel_kinds
@@ -500,17 +503,17 @@ def _bundle(
             apply_cleanup=False,
         )
 
-    # 3) Tile RoPE generics. Each iterates (head, T-row, coord) over a head-outer
+    # 3) Tile materialized RoPE/conversion consumers and fuse tensor producers.
+    #    Each iterates (head, T-row, coord) over a head-outer
     #    (nh,T,hs) view; tile (1, wg_rows, 0) so one grid block owns a single head's
     #    (wg_rows, half) 2D slab -> block load_nd/store_nd (see Builder.rope).
     for rg in rope_handles:
-        structured.structured_tile_using_forall(
-            anytype,
-            anytype,
+        lh_transform.tile(
             rg,
-            num_threads=[],
-            tile_sizes=[],
-            static_tile_sizes=(1, wg_rows, 0),
+            tile_sizes=[1, wg_rows, 0],
+            fuse_producers=True,
+            use_forall=True,
+            apply_cleanup=False,
         )
 
     # 4) Matmuls (their EW producers already wrapped in foralls). Each matmul uses
