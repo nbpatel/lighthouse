@@ -235,16 +235,27 @@ class Builder:
         self.kinds.append("elementwise")
         return emit_buf_to_tensor(buf, restrict=True)
 
-    def add(self, a, b, M, N, out_buf=None):
-        """Residual add: out = a + b  (both (M,N) f32) -> (M,N) f32 buffer."""
+    def add(self, a, b, M, N, out_buf=None, *, materialize=True):
+        """Add in FP32, optionally retaining a tensor result for producer fusion."""
+        if out_buf is not None and not materialize:
+            raise ValueError("An explicit output buffer requires materialization")
         par2 = self._par()
-        buf = out_buf if out_buf is not None else self._buf((M, N), self.f32)
-        out_t = emit_buf_to_tensor(buf, restrict=True, writable=True)
+        buf = out_buf
+        if materialize and buf is None:
+            buf = self._buf((M, N), self.f32)
+        out_t = (
+            emit_buf_to_tensor(buf, restrict=True, writable=True)
+            if materialize
+            else tensor.empty((M, N), self.f32)
+        )
 
         @linalg.generic([a, b], [out_t], [par2, par2, par2], [parallel, parallel])
         def r(x, y, _o):
             return arith.AddFOp(x, y)
 
+        if not materialize:
+            self.kinds.append("elementwise_tensor")
+            return r
         bufferization.materialize_in_destination(
             None, r, buf, restrict=True, writable=True
         )
@@ -569,7 +580,7 @@ def _emit_block_llama(bld, x, w, cos, sin, T, C, hidden, H, n_kv, eps, out_buf=N
         rms1, w["wq"], w["wk"], w["wv"], cos, sin, T, C, H, n_kv
     )  # f16 (T,C)
     proj = bld.matmul(attn16, w["wo"], T, C)  # (T,C) f32, no bias
-    h = bld.add(x, proj, T, C)
+    h = bld.add(x, proj, T, C, materialize=False)
     # ---- FFN sublayer: out = h + swiglu(rms(h)) ----
     rms2 = bld.rmsnorm(h, w["ffn_norm"], T, C, eps, materialize=False)
     z16 = bld.cast_f16(rms2, T, C)
