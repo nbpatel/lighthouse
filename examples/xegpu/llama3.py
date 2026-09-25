@@ -216,7 +216,8 @@ def _lower_payload(T, C, hidden, vocab, n_layers, H, n_kv, hs, eps, causal, dump
     if dump:
         print(payload)
         return None
-    print(f"LOWERED OK: 'llama' to {len(kinds)} kernels in one module")
+    kernel_count = sum(kind != "elementwise_tensor" for kind in kinds)
+    print(f"LOWERED OK: 'llama' to {kernel_count} kernels in one module")
     return payload, kinds
 
 

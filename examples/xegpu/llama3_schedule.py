@@ -21,7 +21,8 @@ so this is one combined schedule that handles all op classes:
                        zero-fill into the loop)
         - fused attn-> `_tile_one_fused_attention_region` (tile @V batch_matmul into
                        a forall, fuse QK^T/scale/softmax/@V in; flash rewrite later)
-        - elementwise -> a single `structured_tile_using_forall` over rows
+        - elementwise -> tile the materialized consumer and fuse tensor producers
+                 into the same forall, with bounded row/column tiles
   (b) Shared tail (same for every kernel): vectorize -> bufferize (tensors ->
       memrefs) -> convert the forall grids to `gpu.launch` -> outline each into
       its own `gpu.module`/`gpu.func` kernel -> attach the XeVM target.
@@ -340,7 +341,7 @@ def build_combined_schedule(
     n_mm = kinds.count("matmul")
     n_rms = kinds.count("rmsnorm")
     n_sm = kinds.count("softmax")
-    n_ew = kinds.count("elementwise")
+    n_ew = kinds.count("elementwise") + kinds.count("elementwise_tensor")
     if mm_params_list is None:
         mm_params_list = [mm_params] * n_mm
     with schedule_boilerplate() as (schedule, named_seq):
@@ -394,7 +395,7 @@ def _bundle(
     anytype = transform.AnyOpType.get()
     rss = ln_params["reduction_step_size"]
     wg_rows = ln_params["wg_rows"]
-    nkernels = len(kinds)
+    nkernels = sum(kind != "elementwise_tensor" for kind in kinds)
     n_fa = kinds.count("fused_attention")
     n_rope = kinds.count("rope")
     if mm_params_list is None:
@@ -413,7 +414,7 @@ def _bundle(
     # rmsnorms (which fuse + cleanup).
     #
     # Generic build order: each rmsnorm contributes [ss_sum, normed] (2), each
-    # elementwise contributes 1, each RoPE contributes 1 (one multi-output generic),
+    # elementwise (materialized or tensor-only) contributes 1, each RoPE contributes 1,
     # and each fused-attention contributes [QK^T, @V] (2) -- the GQA QK^T and @V
     # contractions are linalg.generic ops (not batch_matmul) indexing the narrow
     # K/V by the outer kv dim, emitted right after the q/k/v cast ews. The slices are
@@ -435,6 +436,8 @@ def _bundle(
         elif k == "elementwise":
             ew_handles.append(gen_handles[gi])
             gi += 1
+        elif k == "elementwise_tensor":
+            gi += 1
         elif k == "rope":
             rope_handles.append(gen_handles[gi])
             gi += 1
@@ -442,6 +445,8 @@ def _bundle(
             fa_slices.append((gen_handles[gi], gen_handles[gi + 1]))
             gi += 2
         # matmul contributes no bare linalg.generic here
+
+    kinds = [kind for kind in kinds if kind != "elementwise_tensor"]
 
     # 1) Tile rmsnorms first, using preserved (ss_sum, normed) handles.
     #    Doing this before elementwise/matmul tiling keeps the bare linalg.fill pool
@@ -462,8 +467,8 @@ def _bundle(
             ln_params["T"],
         )
 
-    # 2) Tile elementwise generics into own foralls (handles preserved across
-    #    rmsnorm tiling).
+    # 2) Tile materialized elementwise consumers and fuse their tensor producers
+    #    into the same forall (handles preserved across rmsnorm tiling).
     #    Tile BOTH dims (rows x cols): a row-only tile leaves the full column width
     #    as one per-subgroup vector, so at large widths (the FFN `hidden`, 8192 in
     #    the real 1B model) the kernel's live vector (sg_rows x W x 4B) overruns the
@@ -473,13 +478,12 @@ def _bundle(
     #    anchor layout is unchanged. Widths smaller than the tile just yield one tile.
     ew_wg_cols = ln_params.get("ew_wg_cols", 256)
     for eg in ew_handles:
-        structured.structured_tile_using_forall(
-            anytype,
-            anytype,
+        lh_transform.tile(
             eg,
-            num_threads=[],
-            tile_sizes=[],
-            static_tile_sizes=(wg_rows, ew_wg_cols),
+            tile_sizes=[wg_rows, ew_wg_cols],
+            fuse_producers=True,
+            use_forall=True,
+            apply_cleanup=False,
         )
 
     # 3) Tile RoPE generics. Each iterates (head, T-row, coord) over a head-outer

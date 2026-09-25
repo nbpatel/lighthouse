@@ -48,11 +48,9 @@ def F16():  # 16-bit float (required by the GPU matmul units)
 # =============================================================================
 # Payload: describe what to compute (high-level linalg ops; no tiling/XeGPU yet)
 # =============================================================================
-# Each Builder method emits one high-level op that writes its result into a fresh
-# on-device buffer (`gpu.alloc`), and returns a tensor "view" of that buffer for
-# the next op to read. Because each op writes a distinct device buffer, each will
-# become its OWN GPU kernel later; the buffers are the on-device handoff between
-# kernels (kernel N writes buffer B, kernel N+1 reads B -- no host round-trip).
+# Materialized Builder operations write a fresh device buffer and return a tensor
+# view. Tensor-only elementwise results retain their SSA producer chain so the
+# schedule can fuse them into a materialized consumer's work-group loop.
 #
 # dtype convention: the GPU matmul (DPAS) hardware needs f16 inputs and produces
 # an f32 result. RMSNorm/softmax run in f32. So between a norm/softmax and a
@@ -61,17 +59,17 @@ def F16():  # 16-bit float (required by the GPU matmul units)
 class Builder:
     """Emits the model's ops and remembers the order/kind of each one.
 
-    `kinds` is the crucial bookkeeping: an ordered list, one entry per op emitted,
-    recording its "class" so the schedule (stage 2) can later tile and annotate
-    each kernel correctly. Classes:
+    `kinds` records operations in emission order. Tensor-only elementwise entries
+    participate in generic matching, but do not get their own kernel: the schedule
+    fuses them into their materialized elementwise consumer. Classes:
       'matmul'          = matmul (linalg.matmul)         -> DPAS systolic-array kernel
       'rmsnorm'         = RMSNorm (2 generics + 1 fill)   -> reduction kernel (shared mem)
       'fused_attention' = flash multi-head attention      -> one kernel (QK^T->softmax->@V,
                           online-softmax over K/V tiles; causal mask added by the schedule).
       'rope'            = rotary position embedding       -> head-grid row-parallel kernel
       'elementwise'     = cast / silu / mul / residual    -> row-parallel kernel
-    The op build order in the payload == the order of `kinds` == the order the
-    kernels appear in the final module, which is how the schedule matches them up.
+            'elementwise_tensor' = unmaterialized generic      -> producer for fusion
+        Filtering tensor-only entries gives the kernel order used for annotations.
     """
 
     def __init__(self, T):
@@ -174,12 +172,16 @@ class Builder:
         self.kinds.append("elementwise")
         return emit_buf_to_tensor(buf, restrict=True)
 
-    def silu(self, x, M, N):
-        """SiLU / swish: out = x * sigmoid(x)  (x (M,N) f32) -> (M,N) f32 buffer."""
+    def silu(self, x, M, N, *, materialize=True):
+        """SiLU in f32; optionally keep its result as a fusible tensor."""
         par2 = self._par()
         one = arith.constant(self.f32, 1.0)
-        buf = self._buf((M, N), self.f32)
-        out_t = emit_buf_to_tensor(buf, restrict=True, writable=True)
+        buf = self._buf((M, N), self.f32) if materialize else None
+        out_t = (
+            emit_buf_to_tensor(buf, restrict=True, writable=True)
+            if materialize
+            else tensor.empty((M, N), self.f32)
+        )
 
         @linalg.generic([x], [out_t], [par2, par2], [parallel, parallel])
         def s(v, _o):
@@ -188,22 +190,32 @@ class Builder:
             sig = arith.DivFOp(one, arith.AddFOp(one, math.exp(neg)).result).result
             return arith.MulFOp(v, sig)
 
+        if not materialize:
+            self.kinds.append("elementwise_tensor")
+            return s
         bufferization.materialize_in_destination(
             None, s, buf, restrict=True, writable=True
         )
         self.kinds.append("elementwise")
         return emit_buf_to_tensor(buf, restrict=True)
 
-    def mul(self, a, b, M, N):
-        """Elementwise multiply: out = a * b  (both (M,N) f32) -> (M,N) f32 buffer."""
+    def mul(self, a, b, M, N, *, materialize=True):
+        """Multiply in f32; optionally keep the result as a fusible tensor."""
         par2 = self._par()
-        buf = self._buf((M, N), self.f32)
-        out_t = emit_buf_to_tensor(buf, restrict=True, writable=True)
+        buf = self._buf((M, N), self.f32) if materialize else None
+        out_t = (
+            emit_buf_to_tensor(buf, restrict=True, writable=True)
+            if materialize
+            else tensor.empty((M, N), self.f32)
+        )
 
         @linalg.generic([a, b], [out_t], [par2, par2, par2], [parallel, parallel])
         def m(x, y, _o):
             return arith.MulFOp(x, y)
 
+        if not materialize:
+            self.kinds.append("elementwise_tensor")
+            return m
         bufferization.materialize_in_destination(
             None, m, buf, restrict=True, writable=True
         )
@@ -511,9 +523,9 @@ def _emit_block_llama(bld, x, w, cos, sin, T, C, hidden, H, n_kv, eps, out_buf=N
     rms2 = bld.rmsnorm(h, w["ffn_norm"], T, C, eps)
     z16 = bld.cast_f16(rms2, T, C)
     gate = bld.matmul(z16, w["w1"], T, hidden)  # z@w1 -> (T,hidden) f32
-    gate = bld.silu(gate, T, hidden)  # silu(z@w1)
     up = bld.matmul(z16, w["w3"], T, hidden)  # z@w3 -> (T,hidden) f32
-    prod = bld.mul(gate, up, T, hidden)  # silu(z@w1) * (z@w3)
+    gate = bld.silu(gate, T, hidden, materialize=False)
+    prod = bld.mul(gate, up, T, hidden, materialize=False)
     prod16 = bld.cast_f16(prod, T, hidden)
     o = bld.matmul(prod16, w["w2"], T, C)  # (T,C) f32
     return bld.add(h, o, T, C, out_buf=out_buf)
