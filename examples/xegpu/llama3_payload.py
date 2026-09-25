@@ -59,17 +59,19 @@ def F16():  # 16-bit float (required by the GPU matmul units)
 class Builder:
     """Emits the model's ops and remembers the order/kind of each one.
 
-    `kinds` records operations in emission order. Tensor-only elementwise entries
-    participate in generic matching, but do not get their own kernel: the schedule
-    fuses them into their materialized elementwise consumer. Classes:
+    `kinds` records operations in emission order. Tensor-only entries participate
+    in generic matching but fuse into their materialized consumer. A tensor-only
+    RMSNorm must be immediately followed by its output cast in this schedule.
+    Classes:
       'matmul'          = matmul (linalg.matmul)         -> DPAS systolic-array kernel
       'rmsnorm'         = RMSNorm (2 generics + 1 fill)   -> reduction kernel (shared mem)
+    'rmsnorm_tensor'  = unmaterialized RMSNorm          -> fuse with following cast
       'fused_attention' = flash multi-head attention      -> one kernel (QK^T->softmax->@V,
                           online-softmax over K/V tiles; causal mask added by the schedule).
       'rope'            = rotary position embedding       -> head-grid row-parallel kernel
       'elementwise'     = cast / silu / mul / residual    -> row-parallel kernel
             'elementwise_tensor' = unmaterialized generic      -> producer for fusion
-        Filtering tensor-only entries gives the kernel order used for annotations.
+        Tensor-only RMSNorm's cast inherits the reduction kernel's annotations.
     """
 
     def __init__(self, T):
@@ -110,8 +112,11 @@ class Builder:
             return None
         return emit_buf_to_tensor(buf, restrict=True)
 
-    def rmsnorm(self, x, weight, M, N, eps=1e-5):
-        """RMSNorm(x (M,N) f32, weight (N,)) -> (M,N) f32 buffer.
+    def rmsnorm(self, x, weight, M, N, eps=1e-5, *, materialize=True):
+        """RMSNorm(x (M,N) f32, weight (N,)) -> (M,N) f32 buffer or tensor.
+
+        materialize=False retains the tensor result for schedule-driven fusion
+        with the following output cast; all normalization arithmetic stays f32.
 
         out[i,j] = x[i,j] * rsqrt(mean_k x[i,k]^2 + eps) * weight[j]. No
         mean-subtraction (unlike LayerNorm). Built from 2 linalg.generic ops:
@@ -136,8 +141,12 @@ class Builder:
             return arith.AddFOp(arith.MulFOp(v, v).result, acc)
 
         # (2) normalize + scale -> output
-        buf = self._buf((M, N), f32)
-        out_t = emit_buf_to_tensor(buf, restrict=True, writable=True)
+        buf = self._buf((M, N), f32) if materialize else None
+        out_t = (
+            emit_buf_to_tensor(buf, restrict=True, writable=True)
+            if materialize
+            else tensor.empty((M, N), f32)
+        )
 
         @linalg.generic(
             [x, ss_sum, weight],
@@ -150,6 +159,9 @@ class Builder:
             inv_rms = math.rsqrt(arith.AddFOp(ms, eps_c).result)
             return arith.MulFOp(arith.MulFOp(v, inv_rms).result, w)
 
+        if not materialize:
+            self.kinds.append("rmsnorm_tensor")
+            return normed
         bufferization.materialize_in_destination(
             None, normed, buf, restrict=True, writable=True
         )
@@ -513,14 +525,14 @@ def _emit_block_llama(bld, x, w, cos, sin, T, C, hidden, H, n_kv, eps, out_buf=N
     SwiGLU: w2( silu(z@w1) * (z@w3) ).
     """
     # ---- attention sublayer: h = x + wo(GQA(RoPE(rms(x)))) ----
-    rms1 = bld.rmsnorm(x, w["attn_norm"], T, C, eps)
+    rms1 = bld.rmsnorm(x, w["attn_norm"], T, C, eps, materialize=False)
     attn16 = bld.fused_attention(
         rms1, w["wq"], w["wk"], w["wv"], cos, sin, T, C, H, n_kv
     )  # f16 (T,C)
     proj = bld.matmul(attn16, w["wo"], T, C)  # (T,C) f32, no bias
     h = bld.add(x, proj, T, C)
     # ---- FFN sublayer: out = h + swiglu(rms(h)) ----
-    rms2 = bld.rmsnorm(h, w["ffn_norm"], T, C, eps)
+    rms2 = bld.rmsnorm(h, w["ffn_norm"], T, C, eps, materialize=False)
     z16 = bld.cast_f16(rms2, T, C)
     gate = bld.matmul(z16, w["w1"], T, hidden)  # z@w1 -> (T,hidden) f32
     up = bld.matmul(z16, w["w3"], T, hidden)  # z@w3 -> (T,hidden) f32

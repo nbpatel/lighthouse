@@ -17,8 +17,8 @@ so this is one combined schedule that handles all op classes:
       work-group grid). Different op classes tile differently:
         - matmul   -> `_tile_one_matmul`  (work-group tile + k-loop tile; the
                        DPAS tile sizes come from `mm_params`)
-        - rmsnorm  -> `_tile_one_rmsnorm` (tile rows, fuse the reduction +
-                       zero-fill into the loop)
+        - rmsnorm  -> `_tile_one_rmsnorm` (tile rows, fuse normalization,
+                   reduction + zero-fill and an optional output cast)
         - fused attn-> `_tile_one_fused_attention_region` (tile @V batch_matmul into
                        a forall, fuse QK^T/scale/softmax/@V in; flash rewrite later)
         - elementwise -> tile the materialized consumer and fuse tensor producers
@@ -339,7 +339,7 @@ def build_combined_schedule(
     The narrow K/V projections need their own wg_n/sg_n, so the driver passes a
     list."""
     n_mm = kinds.count("matmul")
-    n_rms = kinds.count("rmsnorm")
+    n_rms = kinds.count("rmsnorm") + kinds.count("rmsnorm_tensor")
     n_sm = kinds.count("softmax")
     n_ew = kinds.count("elementwise") + kinds.count("elementwise_tensor")
     if mm_params_list is None:
@@ -395,7 +395,9 @@ def _bundle(
     anytype = transform.AnyOpType.get()
     rss = ln_params["reduction_step_size"]
     wg_rows = ln_params["wg_rows"]
-    nkernels = sum(kind != "elementwise_tensor" for kind in kinds)
+    nkernels = sum(
+        kind not in {"elementwise_tensor", "rmsnorm_tensor"} for kind in kinds
+    )
     n_fa = kinds.count("fused_attention")
     n_rope = kinds.count("rope")
     if mm_params_list is None:
@@ -429,10 +431,19 @@ def _bundle(
     # (QK^T, @V).
     rms_slices, ew_handles, rope_handles, fa_slices = [], [], [], []
     gi = 0
-    for k in kinds:
+    kernel_kinds = []
+    kind_iter = iter(kinds)
+    for k in kind_iter:
         if k == "rmsnorm":
-            rms_slices.append((gen_handles[gi], gen_handles[gi + 1]))
+            rms_slices.append((gen_handles[gi], gen_handles[gi + 1], None))
             gi += 2
+        elif k == "rmsnorm_tensor":
+            if next(kind_iter, None) != "elementwise":
+                raise ValueError("A tensor RMSNorm must be followed by its output cast")
+            rms_slices.append(tuple(gen_handles[gi : gi + 3]))
+            gi += 3
+            kernel_kinds.append("rmsnorm")
+            continue
         elif k == "elementwise":
             ew_handles.append(gen_handles[gi])
             gi += 1
@@ -445,15 +456,17 @@ def _bundle(
             fa_slices.append((gen_handles[gi], gen_handles[gi + 1]))
             gi += 2
         # matmul contributes no bare linalg.generic here
+        if k != "elementwise_tensor":
+            kernel_kinds.append(k)
 
-    kinds = [kind for kind in kinds if kind != "elementwise_tensor"]
+    kinds = kernel_kinds
 
     # 1) Tile rmsnorms first, using preserved (ss_sum, normed) handles.
     #    Doing this before elementwise/matmul tiling keeps the bare linalg.fill pool
     #    exactly predictable: 1*(untiled rmsnorm) + n_mm (matmul accumulator fills).
     #    elementwise tiling can introduce its own init fills, so finish rmsnorm
     #    fill-fusion first.
-    for i, (ss_red, normalize) in enumerate(rms_slices):
+    for i, (ss_red, normalize, output_cast) in enumerate(rms_slices):
         rms_untiled = n_rms - i
         _tile_one_rmsnorm(
             mod,
@@ -465,6 +478,7 @@ def _bundle(
             rms_untiled,
             n_mm,
             ln_params["T"],
+            output_cast=output_cast,
         )
 
     # 2) Tile materialized elementwise consumers and fuse their tensor producers
@@ -674,11 +688,22 @@ def _bundle(
 
 
 def _tile_one_rmsnorm(
-    mod, anytype, wg_rows, rss, ss_red, normalize, rms_untiled, n_mm, T_ROWS
+    mod,
+    anytype,
+    wg_rows,
+    rss,
+    ss_red,
+    normalize,
+    rms_untiled,
+    n_mm,
+    T_ROWS,
+    output_cast=None,
 ):
-    """Tile one rmsnorm into its own forall, using preserved handles to its 2
-    generics (ss_red = sum-of-squares reduction, normalize). Handles to other ops
-    stay valid.
+    """Tile one RMSNorm, optionally rooted at its separate output cast.
+
+    Normalization and cast share the inner column loop; the FP32 sum-of-squares
+    reduction retains its existing tiling and shared-memory lowering. Handles
+    to other operations stay valid.
 
     The single accumulator fill is selected by result type: rms accumulators are
     rank-1 tensor<T x f32>; matmul accumulators are rank-2. There are rms_untiled
@@ -688,11 +713,15 @@ def _tile_one_rmsnorm(
     _, rms_forall = structured.structured_tile_using_forall(
         anytype,
         anytype,
-        normalize,
+        normalize if output_cast is None else output_cast,
         num_threads=[],
         tile_sizes=[],
         static_tile_sizes=(wg_rows,),
     )
+    if output_cast is not None:
+        _, rms_forall = structured.structured_fuse_into_containing_op(
+            anytype, anytype, producer_op=normalize, containing_op=rms_forall
+        )
     _, rms_forall = structured.structured_fuse_into_containing_op(
         anytype, anytype, producer_op=ss_red, containing_op=rms_forall
     )
@@ -713,15 +742,25 @@ def _tile_one_rmsnorm(
     # slices a copy inside the forall). It must be removed or the next rms finds too
     # many. Apply plain DCE at func scope -- never apply_cse at func scope, which
     # would merge the identical live zero-fills ACROSS rmsnorms. CSE the duplicate
-    # generics inside the forall only (scoped), so the re-match below finds exactly 2.
+    # generics inside the forall only (scoped), preserving the optional cast too.
     transform.apply_cse(rms_forall)
     transform.apply_dce(rms_func)
-    # Re-match the 2 generics INSIDE the forall (scoped, so unambiguous: exactly 2),
-    # then tile the normalize and the sum-of-squares reduction by rss.
-    g2 = match_and_split(rms_forall, ops={"linalg.generic"}, nhandles=2)
-    structured.TileUsingForOp(g2[1], sizes=[0, rss])
+    # Re-match the reduction, normalization, and optional cast inside the forall,
+    # then tile the pointwise output chain and sum-of-squares reduction by rss.
+    generics = match_and_split(
+        rms_forall, ops={"linalg.generic"}, nhandles=2 if output_cast is None else 3
+    )
+    if output_cast is None:
+        structured.TileUsingForOp(generics[1], sizes=[0, rss])
+    else:
+        _, normalize_loop = structured.TileUsingForOp(
+            generics[2], sizes=[0, rss]
+        ).results
+        structured.structured_fuse_into_containing_op(
+            anytype, anytype, producer_op=generics[1], containing_op=normalize_loop
+        )
     structured.structured_tile_reduction_using_for(
-        [anytype], anytype, anytype, anytype, target=g2[0], tile_sizes=[0, rss]
+        [anytype], anytype, anytype, anytype, target=generics[0], tile_sizes=[0, rss]
     )
     transform.apply_cse(rms_forall)
     canonicalize(rms_forall)
