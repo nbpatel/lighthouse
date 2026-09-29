@@ -98,6 +98,9 @@ def fused_attention_schedule(
         - v_load_tile: list[int, int]
         - prefetch_tile: list[int, int]
         - nb_prefetch: int
+        - causal: bool, optional (default False). When True the flash loop masks
+            future keys per query row, so attention is autoregressive and the
+            T x T score matrix never needs an explicit mask tensor.
 
     Returns:
         MLIR module containing the transform schedule
@@ -264,6 +267,7 @@ def bundle_xegpu_fused_attention_schedule(
         scale=scale_const_op,
         output=pv_matmul,
         tile_size=reduction_tile,
+        causal=layer_params.get("causal", False),
     )
     transform.apply_cse(func)
     lh_transform.cleanup(func)

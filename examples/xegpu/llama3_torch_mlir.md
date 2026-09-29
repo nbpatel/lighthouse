@@ -17,11 +17,21 @@ through **torch-mlir**, using lighthouse's existing torch ingress.
   (torch-mlir FX importer) -> linalg-on-tensors. `-o` saves, `--f16` casts first,
   `--dialect` picks torch/tosa/linalg.
 
-## Status: WORKING
+## Status
+### Ingress: WORKING
 `python examples/xegpu/llama3_torch_mlir.py -o /tmp/p.mlir` emits a linalg payload
 that parses in lighthouse's MLIR context. Op histogram:
 `batch_matmul:2, matmul:8, generic:51, fill:9, transpose:5`
 (8 = wq/wk/wv/wo/w1/w2/w3/lm_head; 2 batch_matmul = attention QK^T and @V).
+
+### Milestone 0 -- CPU numerical validation: PASSING
+`python examples/xegpu/llama3_torch_mlir_check.py` lowers the payload to CPU
+(one-shot-bufferize -> convert-linalg-to-loops -> LLVM), JITs it, and checks the
+output against the PyTorch model on the same inputs: `max|diff| = 8.3e-7`,
+"Result matched!". This validates ingress+payload numerics before any GPU work.
+Notes: RMSNorm uses `x*x` and `1/sqrt` (not pow/rsqrt) so it legalizes to libm;
+`@main` returns a tensor, so after bufferization the C wrapper takes a result
+memref descriptor as its first arg; link libmlir_c_runner_utils for `memrefCopy`.
 
 ## Environment
 torch-mlir is NOT in the default env. Installed the cp312-abi3 nightly wheel into
@@ -33,13 +43,42 @@ LLVM / MLIR bindings, so a scoped `--no-deps` install was used instead.
 Ingress bridges torch-mlir's MLIR to lighthouse's via TEXT (str -> re-parse), so
 the two MLIR builds need not be ABI-compatible.
 
+### Feasibility gate -- torch-mlir matmul on Intel GPU (PVC): TOOLCHAIN SURVIVES
+`python examples/xegpu/torch_mlir_matmul_gpu.py` exports `x @ w` (f16) via
+torch-mlir and lowers it with the EXISTING `matmul_schedule` + `xegpu_to_binary`.
+Result: lowers all the way to `gpu.binary` + XeVM, NO segfault. Key facts learned:
+- DPAS needs f16 A/B (f32 accumulate). f32 inputs -> "failed to legalize xegpu.dpas".
+  With f16 inputs torch-mlir emits the exact HW form: matmul ins(f16,f16) outs(f32)
+  -> f32, then truncf to f16.
+- Weights must be a forward INPUT (function arg), not an nn.Parameter -- the matmul
+  schedule prefetches operand buffers, which can't come from a baked constant.
+- The existing per-op-class schedules consume a torch-mlir payload directly.
+Device present: Intel Data Center GPU Max 1100 (PVC), Level Zero.
+
+### Milestone 1a -- torch-mlir matmul EXECUTED on Intel GPU: PASSING
+`torch_mlir_matmul_gpu.py` now runs the full loop and checks numerics:
+rel=4.4e-4, "GPU PASSED". The complete torch-mlir -> XeGPU recipe:
+1. ingress -> linalg (f16 inputs -> DPAS-ready matmul ins(f16,f16) outs(f32)).
+2. `convert_function_results("main")` (lighthouse.schedule.func) -> DPS: return
+   value becomes leading memref arg (output = arg 0), matching the runner.
+3. `GPUMemoryManager.emit_memory_management_funcs(mod, host_inputs=[out,x,w])` ->
+   injects gpu_alloc_/dealloc_/copy_ host wrappers before lowering.
+4. `matmul_schedule` + `xegpu_to_binary()` -> gpu.binary + XeVM.
+5. `Runner(mem_manager_cls=GPUMemoryManager, shared_libs=["libmlir_levelzero_runtime.so"])`
+   .execute(host_input_buffers=[out,x,w], argument_access_callback=arg0 cb).
+
 ## Next steps
-- Feed this payload into the existing schedule. Blocker: the schedule matches ops
-  by position in a hand-maintained `kinds` list; a torch-mlir payload has no
-  `kinds`, and its op structure differs (attention is `batch_matmul` + separate
-  softmax here vs the hand payload's fused flash attention; extra transpose/
-  expand/collapse from head reshapes). Either derive `kinds` from the IR or adapt
-  the schedule to discover op structure.
-- Decide dtype policy: model is f32; payload's f16 DPAS casts are a lowering
-  choice (`--f16` reproduces them end-to-end but changes numerics).
-- Match the pinned torch-mlir version (20260805.836) if IR drift matters.
+Chosen approach: **correctness-first generic GPU schedule** (classify ops by
+walking the IR; no `kinds`, no flash-attention special-casing).
+- Milestone 1 (GPU, correct but unoptimized): tile each op by type into a
+  work-group `forall`, seed a default `sg_layout`/`sg_data` anchor per op type
+  (matmul / batch_matmul / elementwise / reduction), then reuse `xegpu_to_binary()`
+  (`gpu-lower-to-xevm-pipeline`, xegpu-op-level=workgroup) for the automatic
+  wg->sg + layout propagation. NOTE from survey: lighthouse has NO fully-automatic
+  layout assignment -- anchors must be seeded by hand per op. `examples/xegpu/
+  kernel_bench.py` (`infer_parameters` + `lower_to_llvm`) is the nearest generic
+  driver but only routes single-op-class payloads to 4 hand-written schedules.
+- Milestone 2: same PyTorch model -> lighthouse and Inductor -> correctness + timing.
+- Dtype: model is f32; payload's f16 DPAS casts are a lowering choice (`--f16`
+  reproduces them end-to-end but changes numerics).
+- Match pinned torch-mlir 20260805.836 if IR drift matters (installed 20260923).
