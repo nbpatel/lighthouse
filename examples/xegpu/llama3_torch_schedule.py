@@ -467,29 +467,44 @@ def fuse_sibling_slice_writers(mod: ir.Module, func_name: str = "main") -> int:
     block = func.regions[0].blocks[0]
     fused = 0
     # Candidates are visited LAST-insert-first so a chain is taken whole rather than as an
-    # earlier sub-chain that would leave its tail sibling unmerged.
-    for op in reversed(list(block.operations)):
-        block_ops = set(block.operations)
-        if op not in block_ops:
-            continue  # erased by an earlier merge
+    # earlier sub-chain that would leave its tail sibling unmerged. Each merge ERASES ops
+    # that sit earlier in the block, i.e. later in this reversed walk, so the op list is
+    # re-snapshotted after every merge rather than iterated stale: touching an erased
+    # OpView is a use-after-free (measured as a silent segfault at 16 toy layers).
+    progress = True
+    while progress:
+        progress = False
+        ops = list(block.operations)
+        block_ops = set(ops)
+        for op in reversed(ops):
+            if _fuse_one_sibling_chain(block, block_ops, op):
+                fused += 1
+                progress = True
+                break
+    return fused
+
+
+def _fuse_one_sibling_chain(block, block_ops, op) -> bool:
+    """Merge the sibling chain ending at insert `op`, if it is one. True if the IR changed."""
+    if True:
         matched = _sibling_slice_chain(op, block_ops)
         if matched is None:
-            continue
+            return False
         chain, shape = matched
         trees = [_elementwise_tree(ins.operands[0], shape) for ins in chain]
         if any(t is None for t in trees):
-            continue
+            return False
         member_sets = [set(members) for members, _ in trees]
         if any(
             member_sets[i] & member_sets[j]
             for i in range(len(trees))
             for j in range(i + 1, len(trees))
         ):
-            continue  # shared work: merging would duplicate it, so leave it alone
+            return False  # shared work: merging would duplicate it, so leave it alone
         roots = [members[-1] for members, _ in trees]
         result_type = roots[0].results[0].type
         if any(r.results[0].type != result_type for r in roots):
-            continue
+            return False
         elem = ir.ShapedType(result_type).element_type
         leaves = []
         for _, tree_leaves in trees:
@@ -566,8 +581,7 @@ def fuse_sibling_slice_writers(mod: ir.Module, func_name: str = "main") -> int:
                 op_to_drop.operation.erase()
         for ins in chain[:-1]:
             ins.operation.move_before(last.operation)
-        fused += 1
-    return fused
+        return True
 
 
 # The RoPE-specific name this rewrite was introduced under; the drivers still use it.
@@ -1656,6 +1670,123 @@ def _top_level_index(use_owner, ops):
     return None
 
 
+def _redirect_transpose_writer(block, forall, perm, src, dst):
+    """Remove a transpose copy kernel by making its source's PRODUCER write the destination.
+
+    This is the attention OUTPUT transpose: attention writes `(H, T, hs)`, the transpose
+    kernel copies it to `(T, H, hs)`, and a `memref.collapse_shape` then reads that as `(T, C)`
+    for the output projection. The destination cannot become a view (a permuted view is never
+    contiguous, and collapsing needs contiguity), but the SOURCE can: build a permuted view of
+    the destination that has the source's shape, and retarget the producer kernel's stores at
+    it. The producer then writes `dst[t, h, :]` directly -- exactly how the hand payload's
+    attention kernel stores through a strided `(H, T, hs)` view of the `(T, C)` buffer -- and
+    the copy kernel, its buffer and its dealloc are dead.
+
+    Conditions, all checked, any failure leaves the kernel in place:
+      * `src` and `dst` are plain `memref.alloc`s; `src` is written by exactly one preceding
+        top-level forall (the producer) and read by nothing but this kernel until it is next
+        written (bufferization reuses allocs across layers);
+      * `dst` is not touched between the producer and this kernel, since the redirected store
+        lands at the producer's position;
+      * every access to `src` inside the producer is a `vector.transfer_write` directly on the
+        buffer (no subview in between), so the operand can be swapped for the view unchanged:
+        the view is built so that `view[i0, i1, i2] == dst[permuted]`, i.e. the producer's
+        indices stay exactly as they are.
+    Returns True if the kernel was removed.
+    """
+    ops = list(block.operations)
+    here = _top_level_index(forall, ops)
+
+    def is_alloc(v):
+        return isinstance(v, ir.OpResult) and v.owner.operation.name == "memref.alloc"
+
+    if here is None or not is_alloc(src) or not is_alloc(dst):
+        return False
+    writer = None
+    for j in range(here - 1, -1, -1):
+        if _writes_memref(ops[j], src):
+            writer = j
+            break
+    if writer is None or ops[writer].operation.name != "scf.forall":
+        return False
+    next_writer = len(ops)
+    for j in range(here + 1, len(ops)):
+        if _writes_memref(ops[j], src):
+            next_writer = j
+            break
+    for use in src.uses:
+        owner = use.owner
+        if owner.operation.name == "memref.dealloc":
+            continue
+        at = _top_level_index(owner, ops)
+        if at is None:
+            return False
+        if at in (writer, here):
+            continue
+        if writer < at < next_writer:
+            return False  # someone else reads (or writes) src while it is live
+    for use in dst.uses:
+        owner = use.owner
+        if owner.operation.name == "memref.dealloc":
+            continue
+        at = _top_level_index(owner, ops)
+        if at is None:
+            return False
+        if writer <= at < here:
+            return False  # dst holds live data while the producer would already write it
+    stores = []
+
+    def collect(o):
+        for region in o.regions:
+            for blk in region.blocks:
+                for inner in blk.operations:
+                    if any(opnd == src for opnd in inner.operands):
+                        if (
+                            inner.operation.name != "vector.transfer_write"
+                            or inner.operands[1] != src
+                        ):
+                            return False
+                        stores.append(inner)
+                    if collect(inner) is False:
+                        return False
+        return True
+
+    producer = ops[writer]
+    if not collect(producer) or not stores:
+        return False
+    src_type, dst_type = ir.MemRefType(src.type), ir.MemRefType(dst.type)
+    rank = len(perm)
+    if src_type.rank != rank or dst_type.rank != rank:
+        return False
+    # dst.shape[i] == src.shape[perm[i]]; the view has src's shape, so it takes dst's dim
+    # inv[i] at position i.
+    inv = [perm.index(i) for i in range(rank)]
+    dst_strides = _row_major_strides(list(dst_type.shape))
+    # The destination buffer is usually allocated after the producer; hoist its alloc above
+    # it. Only when it actually sits below: bufferization reuses one alloc across layers, and
+    # moving an alloc that is already above would drag it past its earlier uses.
+    dst_at = _top_level_index(dst.owner, ops)
+    if dst_at is not None and dst_at > writer:
+        dst.owner.operation.move_before(producer.operation)
+    with ir.InsertionPoint(producer.operation):
+        dims = [ir.AffineDimExpr.get(i) for i in range(rank)]
+        pmap = ir.AffineMap.get(rank, 0, [dims[inv[i]] for i in range(rank)])
+        view_type = ir.MemRefType.get(
+            [dst_type.shape[inv[i]] for i in range(rank)],
+            dst_type.element_type,
+            layout=ir.StridedLayoutAttr.get(0, [dst_strides[inv[i]] for i in range(rank)]),
+        )
+        view = memref.transpose(view_type, dst, pmap)
+    for store in stores:
+        store.operands[1] = view
+    forall.operation.erase()
+    if not [u for u in src.uses if u.owner.operation.name != "memref.dealloc"]:
+        for use in list(src.uses):
+            use.owner.operation.erase()
+        src.owner.operation.erase()
+    return True
+
+
 def replace_transpose_kernels_with_views(mod, payload_func_name, plan, kernel_params):
     """Delete every transpose KERNEL and present its result as a strided `memref` view.
 
@@ -1721,6 +1852,10 @@ def replace_transpose_kernels_with_views(mod, payload_func_name, plan, kernel_pa
         # real copy kernel. The hand payload avoids it differently, by having the attention
         # kernel STORE through a strided view of the (T,C) buffer rather than transposing after.
         if any(u.owner.operation.name == "memref.collapse_shape" for u in dst.uses):
+            # The other way round, then: leave the destination contiguous and make the
+            # kernel that PRODUCES the source store through a permuted view of it.
+            if _redirect_transpose_writer(block, forall, perm, src, dst):
+                replaced_idx.add(idx)
             continue
         # Build the view immediately BEFORE the copy kernel it replaces. That spot is after
         # the source (the kernel reads it) and before every reader of the destination (they

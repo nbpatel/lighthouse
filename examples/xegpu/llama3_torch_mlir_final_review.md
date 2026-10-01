@@ -3,8 +3,9 @@
 Branch `llama3_actual_data_torch_mlir`, reviewed 2026-09-30.
 
 This is the end-of-effort summary. It records every fusion applied between the raw torch-mlir
-export of a Llama-3 decoder block and the 15-kernel-per-layer schedule that now runs all 16
-layers of Llama-3.2-1B on the Intel Data Center GPU Max 1100 with real weights, and it compares
+export of a Llama-3 decoder block and the 14-kernel-per-layer schedule (15 until 2026-09-30,
+section 4.8) that now runs all 16 layers of Llama-3.2-1B on the Intel Data Center GPU Max 1100
+with real weights, and it compares
 each fusion with what the hand-written lighthouse payload and PyTorch Inductor do for the same
 op. The last section pulls out the rules that are not Llama-specific.
 
@@ -62,7 +63,8 @@ is a view.
 | 4. ABSORB rule | 22 | 354 | reduction group owns the elementwise head of its chain | section 4.3 |
 | 5. head-major transposes become views | 19 | 306 | `replace_transpose_kernels_with_views` (post-bufferization) | section 4.5 |
 | 6. RoPE halves fused | 17 | 274 | `fuse_sibling_slice_writers` (alias `fuse_rope_halves`) + `redirect_staged_destination_copies` | section 4.6 |
-| 7. GQA broadcasts folded | **15** | **242** | `fold_gqa_broadcasts` (post-bufferization) | section 4.7 |
+| 7. GQA broadcasts folded | 15 | 242 | `fold_gqa_broadcasts` (post-bufferization) | section 4.7 |
+| 8. attention output transpose folded into the attention store | **14** | **226** | `_redirect_transpose_writer` inside `replace_transpose_kernels_with_views` (post-bufferization) | section 4.8 |
 | hand payload | 15 | 243 | | |
 | Inductor | 14 | -- | | |
 
@@ -275,6 +277,32 @@ and the result would have been silently wrong. Fix: window **both** the destinat
 source live ranges, walking through `memref.transpose` to the underlying buffer. Now the flag
 alone correctly folds V only.
 
+### 4.8 The attention output transpose folded into the attention store (step 8, 2026-09-30)
+
+**What.** The one transpose step 5 had to leave alone -- attention writes `(H,T,hs)`, a copy
+kernel makes `(T,H,hs)`, a `memref.collapse_shape` reads that as `(T,C)` for the output
+projection -- is gone. The attention kernel now stores through a permuted `memref.transpose`
+view of the `(T,H,hs)` buffer (`strided<[hs, C, 1]>`), so its output tile lands at
+`dst[t.., h, :]` directly and the `collapse_shape` keeps its contiguous buffer. This is exactly
+how the hand payload's attention kernel stores (through a strided view of the `(T,C)` buffer)
+and how Inductor's SDPA call is told its output layout.
+
+**How.** `_redirect_transpose_writer`, the second strategy in `replace_transpose_kernels_with_views`,
+taken when the destination has a `collapse_shape` reader: find the single producer forall of
+the transpose's source, check the live ranges of BOTH buffers (nothing else touches the source
+until its next write; nothing touches the destination between producer and copy), require the
+producer's accesses to be direct `transfer_write`s on the buffer, build the view with the
+source's shape (so the store's indices are unchanged), swap it in, hoist the destination alloc
+above the producer only if it is defined below (bufferization reuses allocs across layers;
+moving one already above broke dominance at 2 layers), erase the copy kernel and the dead
+source buffer.
+
+**Measured.** Block toy 15 -> 14 (rel 4.6e-4), block 1B width 14 (rel 7.7e-4), block
+views-only 19 -> 18, 2 layers 14/layer (rel 6.8e-4), 16 layers with real Llama-3.2-1B weights
+**242 -> 226 kernels, ' Paris', rel 9.0e-4**, top-5 logits identical to the 242-kernel run.
+Found on the way: a use-after-free in the generalised RoPE matcher (stale reverse iteration over
+erased ops; silent segfault at 16 toy layers only), fixed by re-snapshotting after each merge.
+
 ## 5. Three-way comparison: Inductor, hand payload, torch-mlir schedule
 
 Per decoder layer. "Same fusion?" asks whether the same ops end up in the same launch, not
@@ -290,11 +318,11 @@ whether the mechanism is the same.
 | F5 both residual adds | 1: recompute x+p, add d | 1: recompute (x+p)+d | 1: h + d (h already materialised by F3's placement) | Yes |
 | SDPA | 1 external fused attention; causal; GQA by strides | 1: `replace_with_fused_attention` on a rank-5 GQA view whose K/V map omits `rep` | 1: same library op via the attention group; causal via the plumbed flag; GQA via `fold_gqa_broadcasts` | Yes |
 | Head-major Q/K/V transposes | 0: `permute` is metadata | 0: `memref.expand_shape` + `memref.transpose` views | 0: `replace_transpose_kernels_with_views`, identical strides to Inductor | Yes |
-| Attention output transpose | 0: attention writes the layout SDPA is told to | 0: attention stores through a strided view of the `(T,C)` buffer | **1**: cannot be a view (`collapse_shape` reader); the one remaining gap | No |
+| Attention output transpose | 0: attention writes the layout SDPA is told to | 0: attention stores through a strided view of the `(T,C)` buffer | 0 (was 1): the attention kernel stores through a `memref.transpose` view of the `(T,H,hs)` buffer (`_redirect_transpose_writer`, section 4.8) | Yes |
 | GQA K/V broadcast | 0 | 0 | 0 (was 2) | Yes |
 | V-projection f16 cast | 0: `mm` returns f16 | **1**: separate `cast_f16_buf` kernel | 0: fused as V-matmul epilogue | Ours matches Inductor; hand does not |
 | 7 projections | 7 external `mm` | 7 `linalg.matmul` | 7 `linalg.matmul` | Yes, all three keep them separate |
-| **Total** | **14** | **15** | **15** | |
+| **Total** | **14** | **15** | **14** | |
 
 Three observations from the table:
 
@@ -400,12 +428,9 @@ These came out of the work above and should carry to any model exported through 
 
 ## 8. Remaining gap and follow-ups
 
-- **Attention output transpose (+1 vs Inductor).** The hand payload avoids it by storing
-  attention output through a strided `(H,T,hs)` view of the `(T,C)` projection input. The
-  analogous post-bufferization move is to redirect the attention kernel's `transfer_write` at a
-  `memref.transpose` view of the O-projection's input buffer, the same trick as
-  `redirect_staged_destination_copies` with a permuted view instead of a subview. Untested;
-  would land at 14.
+- **Attention output transpose: CLOSED 2026-09-30** (section 4.8). The attention kernel's
+  `transfer_write` is redirected at a `memref.transpose` view of the O-projection's input
+  buffer. 14 per layer, 226 kernels for 16 layers, real weights still ' Paris'.
 - **Joins as epilogues of the last contraction (untried, worth 1 to 2 kernels per layer).**
   `gate * up` and `h + o` each read two matmul kernels and are given their own kernel by the
   join rule. But the earlier of the two producers is already inside its forall when the later
