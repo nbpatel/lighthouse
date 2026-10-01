@@ -1814,6 +1814,7 @@ def replace_transpose_kernels_with_views(mod, payload_func_name, plan, kernel_pa
     foralls = [o for o in block.operations if o.operation.name == "scf.forall"]
     if len(foralls) != len(plan):
         raise ValueError(f"{len(foralls)} foralls vs {len(plan)} plan entries")
+    kind_of = {f.operation: e["kind"] for f, e in zip(foralls, plan)}
 
     replaced_idx: set = set()
     for idx, (entry, forall) in enumerate(zip(list(plan), list(foralls))):
@@ -1888,6 +1889,15 @@ def replace_transpose_kernels_with_views(mod, payload_func_name, plan, kernel_pa
             if _writes_memref(ops[j], dst):
                 next_writer = j
                 break
+        # A contraction cannot block-load its operand through permuted strides (e.g. `W.T`).
+        if any(
+            (at := _top_level_index(u.owner, ops)) is not None
+            and here < at < next_writer
+            and kind_of.get(ops[at].operation) in _CONTRACTION_KINDS
+            for u in dst.uses
+        ):
+            view.owner.operation.erase()
+            continue
         for use in list(dst.uses):
             owner = use.owner
             if owner.operation.name == "memref.dealloc":

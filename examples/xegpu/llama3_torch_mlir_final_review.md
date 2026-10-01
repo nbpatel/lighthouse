@@ -5,7 +5,7 @@ Branch `llama3_actual_data_torch_mlir`, reviewed 2026-09-30.
 This is the end-of-effort summary. It records every fusion applied between the raw torch-mlir
 export of a Llama-3 decoder block and the 14-kernel-per-layer schedule (15 until 2026-09-30,
 section 4.8) that now runs all 16 layers of Llama-3.2-1B on the Intel Data Center GPU Max 1100
-with real weights, and it compares
+with real weights (loaded as torch parameters since 2026-10-01, section 4.9), and it compares
 each fusion with what the hand-written lighthouse payload and PyTorch Inductor do for the same
 op. The last section pulls out the rules that are not Llama-specific.
 
@@ -31,8 +31,8 @@ told the schedule what every op is.
 The question was: **can a schedule alone, with no human-authored payload and no per-op `kinds`
 list, take the compiler-generated IR to the same place, and which fusion rules does it need?**
 
-Answer: yes, to parity with the hand payload (15 = 15) and one kernel short of Inductor (14),
-with every rule derived from the IR. The rules are listed in section 5.
+Answer: yes -- to 14 kernels per layer, which matches Inductor (14) and is one below the hand
+payload (15), with every rule derived from the IR. The rules are listed in section 6.
 
 ## 2. Starting point: what torch-mlir hands over
 
@@ -70,8 +70,9 @@ is a view.
 
 Correctness held at every step: block rel error 4e-4 to 7e-4 against the f32 reference, and the
 16-layer real-weights run predicts ' Paris' for "The capital of France is" with **bit-identical
-logits** on the copy path and after each of steps 5, 6 and 7 (rel 9.01e-4 to the f16 payload in
-all four). Bit-identity is the evidence that the three post-bufferization rewrites are pure
+logits** on the copy path and after each of steps 5, 6, 7 and 8 (rel 9.01e-4 to the f16 payload
+in all five; the step-8 run's top-5 logits match the 242-kernel run). Bit-identity is the
+evidence that the four post-bufferization rewrites are pure
 layout changes and not approximations.
 
 ## 4. Each fusion: what, why, how, and what did not work
@@ -202,8 +203,10 @@ this copy with a view" op, so `replace_transpose_kernels_with_views` runs in Pyt
 **Two gotchas that cost time.**
 - The attention **output** transpose `(H,T,hs) -> (T,H,hs)` cannot be a view: its reader
   collapses to `(T, C)` and `collapse_shape` of a permuted view is never contiguous. The pass
-  skips any transpose with a `collapse_shape` reader. This is the one remaining kernel over
-  Inductor.
+  skips any transpose with a `collapse_shape` reader. (It was the last kernel over Inductor
+  until step 8 removed it from the other side: section 4.8.) It also skips a transpose read
+  by a contraction kernel: a matmul cannot block-load an operand through permuted strides, so
+  a `W.T` weight view fails XeGPU annotation ("Could not find a matching xegpu.load_nd").
 - `replace_all_uses_with` is **unsound**. One-shot bufferization reuses one alloc for K's and V's
   results (non-overlapping lifetimes), so replacing every use hands V's readers K's view. The
   replacement is windowed to the live range: uses after this kernel and before the next writer
@@ -303,6 +306,32 @@ views-only 19 -> 18, 2 layers 14/layer (rel 6.8e-4), 16 layers with real Llama-3
 Found on the way: a use-after-free in the generalised RoPE matcher (stale reverse iteration over
 erased ops; silent segfault at 16 toy layers only), fixed by re-snapshotting after each merge.
 
+### 4.9 Real weights as torch parameters, no MLIR-side loader (2026-10-01)
+
+**What.** `torch_mlir_llama_gpu.py --model` no longer uses `llama3_weights.py`. The checkpoint
+is loaded with `safetensors.torch.load_file` into `nn.Parameter`s keyed by the HuggingFace names
+(`HFParamLlama`), and the graph is captured the way `kernel_bench.py` captures it: under
+`torch.compile`, Dynamo lifts parameters into graph placeholders, so torch-mlir imports them as
+function **arguments** and the GPU receives the torch tensors directly. RoPE tables come from
+transformers' `LlamaRotaryEmbedding` (rope_theta and llama3 frequency scaling included). The
+payload math is unchanged: the wrapper hands the parameters to `Llama3` in `BLOCK_WEIGHTS` order,
+so the IR and plan are the same as before. Suggested by Tuomas.
+
+**Two details that matter.**
+- `import_from_model(nn.Module)` would bake the same parameters as `dense_resource` constants
+  (measured), which the matmul schedule cannot prefetch from. The `torch.compile` capture is
+  what makes parameters arguments.
+- HF stores projections `[out, in]`. Using them as-is means `W.T` in the forward, i.e. one 2-D
+  `linalg.transpose` per projection; those kernels fail XeGPU distribution and cannot be views
+  (section 4.5). So the state dict is transposed once in torch before `load_state_dict`, and the
+  tied LM head is the embedding table transposed. The embedding lookup stays on the host.
+
+**Measured.** 16 layers, real Llama-3.2-1B, all rewrites: **226 kernels, ' Paris'**, rel
+9.01e-4 vs the f16 payload and 7.2e-4 vs f32, top-5 logits identical to the loader path, and a
+new direct check against transformers' `LlamaForCausalLM` (f32): ' Paris' MATCH, logits rel
+7.3e-4. 2 layers real and 2 layers synthetic also pass. `llama3_weights.py` remains for the
+hand-payload path (`llama3.py`, `llama3_profile.py`).
+
 ## 5. Three-way comparison: Inductor, hand payload, torch-mlir schedule
 
 Per decoder layer. "Same fusion?" asks whether the same ops end up in the same launch, not
@@ -337,7 +366,7 @@ Three observations from the table:
    why F3/F4 are placed differently at the same launch count.
 3. **Neither reference ever moves data for a layout change.** Both carry head permutations and
    GQA in strides. The torch-mlir export has to be brought to that state after bufferization,
-   which is what the three post-bufferization rewrites do.
+   which is what the four post-bufferization rewrites do.
 
 ## 6. Rules that are not Llama-specific
 
@@ -392,8 +421,10 @@ These came out of the work above and should carry to any model exported through 
 
 **Payload discipline (things that must be true of the exported IR)**
 
-14. f16 inputs so DPAS gets `matmul ins(f16,f16) outs(f32)`; weights as forward arguments, not
-    parameters (baked constants break operand prefetch); DPS via `convert_function_results`.
+14. f16 inputs so DPAS gets `matmul ins(f16,f16) outs(f32)`; weights must reach MLIR as
+    function arguments, not baked constants (constants break operand prefetch) -- either as
+    forward arguments or as `nn.Parameter`s captured under `torch.compile` (section 4.9), stored
+    `[in, out]` so no `W.T` appears; DPS via `convert_function_results`.
 15. No `keepdim` reductions (restore rank at the use site); hand-spelled softmax; no explicit
     mask tensor; 2-D views for anything with a head dim (rank-3 does not distribute); slice-assign
     into `empty_like` instead of `torch.cat` / `stack` / `flip`.
@@ -426,7 +457,7 @@ These came out of the work above and should carry to any model exported through 
 - Nothing in the grouping rules, the ABSORB/MERGE rules, the transpose-views pass or the
   redirect pass mentions Llama, heads, or RoPE.
 
-## 8. Remaining gap and follow-ups
+## 8. Follow-ups
 
 - **Attention output transpose: CLOSED 2026-09-30** (section 4.8). The attention kernel's
   `transfer_write` is redirected at a `memref.transpose` view of the O-projection's input
@@ -438,11 +469,11 @@ These came out of the work above and should carry to any model exported through 
   from memory, the way the residual add reads `x`. The mini-FFN spike (plan doc section 3c)
   did this and measured 3 kernels for the FFN; the coarse join rule, added for `h + o`,
   removed it. A finer rule ("fuse into the last contraction if all others are already tiled")
-  would land at 13 or 14 per layer.
+  would land at 12 or 13 per layer.
 - **Performance is not benchmarked.** Everything here is launch count and correctness. The
   kernel-count parity says nothing yet about time per layer vs the hand path or vs oneDNN's
   `mm`, and the M-iii cost-model item in the plan is open.
-- The three post-bufferization rewrites are behind flags (`--transpose-views`, `--fuse-halves`,
+- The post-bufferization rewrites are behind flags (`--transpose-views`, `--fuse-halves`,
   `--fold-gqa`) on the block and model drivers and are not the default path.
 - **Optional upstream follow-up:** `one-shot-bufferize-disjoint-inserts.patch` (drafted, unbuilt)
   adds a disjoint-inserts rule to `OneShotAnalysis.cpp::areNonConflictingSubsets`. On its own it
@@ -453,7 +484,14 @@ These came out of the work above and should carry to any model exported through 
   `replace_with_fused_attention` validation paths raise instead of crashing.
 - Agreed and deferred: consolidate the drivers onto `kernel_bench`. The block diagram
   `post-fusion-torch-mlir.jpg` (repo root) was regenerated at 15 kernels on 2026-09-30 from the
-  measured plan; `_gen_post_fusion_graph.py` is its source.
+  measured plan and is now one kernel stale (no output transpose); `_gen_post_fusion_graph.py`
+  is its source.
+- HF-layout weights (`[out, in]`, `W.T` in the forward) would remove the one-line transpose in
+  section 4.9, but need either a lowering for the 2-D transpose kernel or a transpose-B matmul.
+- Llama3-8B (d_head 128): the plan is identical to 1B, but tiling stops at the attention scale,
+  which torch-mlir emits as `arith.truncf` of an f64 constant (1/sqrt(128) is not exact in f16;
+  1/8 is). The scale search and `replace_with_fused_attention` need to look through it, and
+  fused attention needs 128-wide head tiling. See `tuomas_llama3.md`.
 
 ## 9. Measured against the "smarter lowering schedule" plan
 
@@ -474,10 +512,11 @@ real model. This is what each stage got, and what it did not.
 | 4. XeGPU annotations from WG/SG sizes | Yes | Per kernel, keyed by class: `xegpu_wg_annotation_for_mlp_layer` (contractions), `xegpu_wg_annotation_for_elemwise_layer`, `xegpu_fa_annotation` (attention), and for reductions `sg_layout = [wg_m // sg_m, 1]` anchored on the stores with layout propagation deriving the loads. `convert-vector-to-xegpu` runs per kernel so SLM promotion stays selective | Annotations are reused from the library and the hand schedule, not re-derived. The single-DPAS matmul annotation is what forces "one contraction per kernel" (section 6.3) |
 | 5. Common tail | Yes | `xegpu_to_binary()` = `gpu-lower-to-xevm-pipeline`, identical to the hand path | -- |
 
-**What the plan is missing, learned here.** Two of the seven fusions that reach parity cannot
+**What the plan is missing, learned here.** Three of the eight fusions that reach 14 cannot
 be expressed at stage 2 at all, because linalg-on-tensors has no view of a permuted or
-broadcast *value*: the head-major transposes as strided views and the zero-copy GQA (sections
-4.5, 4.7). They live in a **stage 2.5, "layout rewrites after bufferization, before
+broadcast *value*: the head-major transposes as strided views, the attention output transpose
+folded into the attention store, and the zero-copy GQA (sections 4.5, 4.8, 4.7). They live in a
+**stage 2.5, "layout rewrites after bufferization, before
 outlining"**, run in Python because the transform dialect has no ops for them, and they need
 live-range windowing on both source and destination because bufferization reuses allocs. Any
 generic schedule that wants to match Inductor's launch count on an attention model needs this

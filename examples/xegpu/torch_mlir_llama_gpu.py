@@ -20,6 +20,8 @@ import types
 
 import numpy as np
 import torch
+import torch._dynamo as dynamo
+import torch.nn as nn
 from mlir import ir
 
 from lighthouse import dialects as lh_dialects
@@ -31,6 +33,7 @@ from lighthouse.schedule.func import convert_function_results
 from lighthouse.schedule.xegpu import xegpu_to_binary
 
 from llama3_torch_model import (
+    BLOCK_WEIGHTS,
     Llama3,
     expand_rope_tables,
     make_weights,
@@ -91,73 +94,160 @@ def reference(
         return model(*(a.to(dtype) for a in args_tuple)).float().numpy()
 
 
-def real_inputs(args):
-    """Load a real HuggingFace Llama-3.2 checkpoint into this payload's argument order.
+_PROJ_SHAPES = {  # HF `[out, in]`, as (out, in) in units of (C, hidden, kv_dim)
+    "self_attn.q_proj": ("C", "C"),
+    "self_attn.k_proj": ("kv", "C"),
+    "self_attn.v_proj": ("kv", "C"),
+    "self_attn.o_proj": ("C", "C"),
+    "mlp.gate_proj": ("hidden", "C"),
+    "mlp.up_proj": ("hidden", "C"),
+    "mlp.down_proj": ("C", "hidden"),
+}
+# `BLOCK_WEIGHTS` order, by HF name.
+_HF_BLOCK = {
+    "attn_norm": "input_layernorm",
+    "wq": "self_attn.q_proj",
+    "wk": "self_attn.k_proj",
+    "wv": "self_attn.v_proj",
+    "wo": "self_attn.o_proj",
+    "ffn_norm": "post_attention_layernorm",
+    "w1": "mlp.gate_proj",
+    "w2": "mlp.down_proj",
+    "w3": "mlp.up_proj",
+}
 
-    Reuses `llama3_weights.py` -- the loader the hand-payload driver (`llama3.py --model`)
-    uses -- so both paths consume the SAME checkpoint tensors in the same `[in, out]` layout.
-    The embedding lookup and the RoPE tables are host-side in both, for the same reason: a
-    gather is not something this schedule lowers, and the tables are data, not compute.
 
-    Returns (dims, n_layers, eps, fwd, tokenizer, ids, n_tok).
+def _key(hf_name):
+    """`nn.ParameterDict` key for an HF parameter name (keys may not contain dots)."""
+    return hf_name.replace(".", "__")
+
+
+class HFParamLlama(nn.Module):
+    """`Llama3` over `nn.Parameter`s named like the HuggingFace checkpoint.
+
+    Projections are stored `[in, out]` (the checkpoint transposed once in torch): HF's `[out, in]`
+    would need `W.T` in the forward, i.e. a 2-D transpose kernel per projection, and those do not
+    lower. The tied LM head is likewise the embedding table transposed. The embedding lookup
+    itself stays on the host.
     """
-    from llama3_weights import load_llama_weights, rope_tables_from_config
 
-    W = load_llama_weights(args.model, n_layers=args.layers)
-    cfg = W["cfg"]
-    C, H = cfg["hidden_size"], cfg["num_attention_heads"]
-    n_kv, hidden = cfg["num_key_value_heads"], cfg["intermediate_size"]
-    vocab, eps = cfg["vocab_size"], cfg["rms_norm_eps"]
-    n_layers = len(W["layers"])
+    def __init__(self, cfg, n_layers):
+        super().__init__()
+        C, hidden = cfg.hidden_size, cfg.intermediate_size
+        H, n_kv = cfg.num_attention_heads, cfg.num_key_value_heads
+        size = {"C": C, "hidden": hidden, "kv": n_kv * (C // H)}
+        self.n_layers = n_layers
+        self.llama = Llama3(C, hidden, cfg.vocab_size, H, n_kv, n_layers, cfg.rms_norm_eps)
+        self.params = nn.ParameterDict()
+        for i in range(n_layers):
+            for name in ("input_layernorm", "post_attention_layernorm"):
+                self.params[_key(f"model.layers.{i}.{name}.weight")] = nn.Parameter(
+                    torch.ones(C)
+                )
+            for name, (out_f, in_f) in _PROJ_SHAPES.items():
+                self.params[_key(f"model.layers.{i}.{name}.weight")] = nn.Parameter(
+                    torch.empty(size[in_f], size[out_f])
+                )
+        self.params[_key("model.norm.weight")] = nn.Parameter(torch.ones(C))
+        self.params[_key("lm_head.weight")] = nn.Parameter(torch.empty(C, cfg.vocab_size))
 
-    from transformers import AutoTokenizer
+    def weight_pack(self):
+        """The weights in `Llama3.forward` order: n_layers * BLOCK_WEIGHTS, final norm, LM head."""
+        p = self.params
+        pack = [
+            p[_key(f"model.layers.{i}.{_HF_BLOCK[w]}.weight")]
+            for i in range(self.n_layers)
+            for w in BLOCK_WEIGHTS
+        ]
+        return (*pack, p[_key("model.norm.weight")], p[_key("lm_head.weight")])
+
+    def forward(self, x, cos_q, sin_q, cos_k, sin_k):
+        return self.llama(x, cos_q, sin_q, cos_k, sin_k, *self.weight_pack())
+
+
+def capture_graph(model, inputs):
+    """The (GraphModule, example_inputs) `torch.compile` hands a backend -- as in kernel_bench.
+
+    Dynamo lifts the parameters into graph placeholders, so torch-mlir imports them as function
+    ARGUMENTS; `import_from_model(nn.Module)` would instead bake them as `dense_resource`
+    constants, which the matmul schedule cannot prefetch from.
+    """
+    got = {}
+
+    def backend(gm, example_inputs):
+        got["gm"], got["ex"] = gm, example_inputs
+        raise RuntimeError("graph captured")
+
+    dynamo.reset()
+    try:
+        torch.compile(model, backend=backend, dynamic=False, fullgraph=True)(*inputs)
+    except Exception:
+        if "gm" not in got:
+            raise
+    return got["gm"], list(got["ex"])
+
+
+def real_model(args):
+    """Real Llama-3.2 weights, loaded the kernel_bench way: into torch parameters.
+
+    Returns (model, activations, dims, n_layers, eps, tokenizer, ids, n_tok). `activations` are
+    the forward inputs (x, cos_q, sin_q, cos_k, sin_k); the weights travel as the model's
+    parameters.
+    """
+    from safetensors.torch import load_file
+    from transformers import AutoTokenizer, LlamaConfig
+    from transformers.models.llama.modeling_llama import LlamaRotaryEmbedding
+
+    cfg = LlamaConfig.from_pretrained(args.model)
+    n_layers = min(args.layers, cfg.num_hidden_layers)
+    C, H, n_kv = cfg.hidden_size, cfg.num_attention_heads, cfg.num_key_value_heads
+    dims = (C, cfg.intermediate_size, cfg.vocab_size, H, n_kv)
+
+    sd = load_file(f"{args.model}/model.safetensors")
+    embed = sd.pop("model.embed_tokens.weight")
+    sd = {
+        k: v.T.contiguous() if k.endswith("_proj.weight") else v
+        for k, v in sd.items()
+        if not k.startswith("model.layers.") or int(k.split(".")[2]) < n_layers
+    }
+    sd["lm_head.weight"] = embed.T.contiguous()  # tie_word_embeddings
+    model = HFParamLlama(cfg, n_layers)
+    model.params.load_state_dict({_key(k): v for k, v in sd.items()}, strict=True)
+    model = model.half().eval().requires_grad_(False)
+    del sd
 
     tok = AutoTokenizer.from_pretrained(args.model)
-    ids = tok(args.prompt, return_tensors="np")["input_ids"][0].astype(np.int64)
+    ids = tok(args.prompt, return_tensors="pt")["input_ids"][0]
+    T = args.seq or len(ids)
+    ids = ids[:T]
     n_tok = len(ids)
-    T = args.seq or n_tok
-    ids, n_tok = ids[:T], min(n_tok, T)
-
-    # Host embedding lookup: x[t] = embed_tokens[ids[t]]. Rows past the prompt stay zero;
-    # with causal masking they cannot affect the prompt positions' logits.
-    x = np.zeros((T, C), np.float32)
-    x[:n_tok] = W["embeddings"][ids]
-
-    cos, sin = rope_tables_from_config(cfg, T)
-    cos_t, sin_t = torch.from_numpy(cos).half(), torch.from_numpy(sin).half()
-
-    # Norm gains come back f32 (the hand payload norms in f32); this payload is f16
-    # throughout, so cast. They are gains near 1, so f16 is ample.
-    def t16(a):
-        return torch.from_numpy(np.ascontiguousarray(a)).half()
-
-    weights = []
-    for layer in W["layers"]:
-        weights += [
-            t16(layer["an"]),
-            t16(layer["wq"]),
-            t16(layer["wk"]),
-            t16(layer["wv"]),
-            t16(layer["wo"]),
-            t16(layer["fn"]),
-            t16(layer["w1"]),
-            t16(layer["w2"]),
-            t16(layer["w3"]),
-        ]
-    weights += [t16(W["fn_w"]), t16(W["lmw"])]
-
-    fwd = (
-        torch.from_numpy(x).half(),
-        *expand_rope_tables(cos_t, sin_t, H),
-        *expand_rope_tables(cos_t, sin_t, n_kv),
-        *weights,
-    )
+    # Host embedding lookup. Rows past the prompt stay zero; the causal mask keeps them out of
+    # the prompt positions' logits.
+    x = torch.zeros(T, C, dtype=torch.float16)
+    x[:n_tok] = embed[ids].half()
+    # transformers' own RoPE (rope_theta + llama3 frequency scaling); `cos` repeats its halves.
+    cos, sin = LlamaRotaryEmbedding(cfg)(x.float(), torch.arange(T)[None])
+    half = C // H // 2
+    cos, sin = cos[0, :, :half].half(), sin[0, :, :half].half()
+    act = (x, *expand_rope_tables(cos, sin, H), *expand_rope_tables(cos, sin, n_kv))
     print(
-        f"  checkpoint {args.model}: C={C} hidden={hidden} H={H} n_kv={n_kv} "
-        f"vocab={vocab} layers={n_layers} eps={eps}"
+        f"  checkpoint {args.model}: C={C} hidden={dims[1]} H={H} n_kv={n_kv} "
+        f"vocab={dims[2]} layers={n_layers} eps={cfg.rms_norm_eps}"
     )
     print(f"  prompt {args.prompt!r} -> {n_tok} tokens, T={T}")
-    return (C, hidden, vocab, H, n_kv), n_layers, eps, fwd, tok, ids, n_tok
+    return model, act, dims, n_layers, cfg.rms_norm_eps, tok, ids, n_tok
+
+
+def hf_reference_logits(args, n_layers, ids):
+    """transformers' own `LlamaForCausalLM` (f32, CPU) on the prompt: an independent check."""
+    from transformers import LlamaConfig, LlamaForCausalLM
+
+    cfg = LlamaConfig.from_pretrained(args.model, num_hidden_layers=n_layers)
+    hf = LlamaForCausalLM.from_pretrained(
+        args.model, config=cfg, torch_dtype=torch.float32
+    ).eval()
+    with torch.no_grad():
+        return hf(ids[None]).logits[0].numpy()
 
 
 def main():
@@ -166,8 +256,8 @@ def main():
     ap.add_argument(
         "--model",
         default="",
-        help="HuggingFace Llama-3.2 checkpoint dir: real weights and a real prompt "
-        "(same loader as the hand-payload driver llama3.py --model)",
+        help="HuggingFace Llama-3.2 checkpoint dir: real weights and a real prompt, loaded "
+        "into torch parameters that torch.compile lifts to MLIR arguments (as kernel_bench)",
     )
     ap.add_argument("--prompt", default="The capital of France is")
     ap.add_argument("--seq", type=int, default=256)
@@ -204,12 +294,14 @@ def main():
     )
     ap.add_argument("--inspect", action="store_true", help="print plan, no GPU run")
     args = ap.parse_args()
-    tok = ids = n_tok = None
+    tok = ids = n_tok = hf_model = None
     eps = 1e-5
     if args.model:
-        dims, L, eps, fwd, tok, ids, n_tok = real_inputs(args)
+        hf_model, act, dims, L, eps, tok, ids, n_tok = real_model(args)
         C, hidden, vocab, H, n_kv = dims
-        T = fwd[0].shape[0]
+        T = act[0].shape[0]
+        # The same tensors in `Llama3.forward` order, for the PyTorch references below.
+        fwd = (*act, *hf_model.weight_pack())
     else:
         T, C, hidden = args.seq, args.width, args.hidden
         H, n_kv, vocab, L = args.heads, args.kv, args.vocab, args.layers
@@ -229,9 +321,13 @@ def main():
 
     with ir.Context(), ir.Location.unknown():
         lh_dialects.register_and_load()
-        model = Llama3(C, hidden, vocab, H, n_kv, L, eps).eval()
-
-        mod = import_from_model(model, fwd, ir_context=ir.Context.current)
+        if hf_model is not None:
+            gm, graph_args = capture_graph(hf_model, act)
+            mod = import_from_model(gm, graph_args, ir_context=ir.Context.current)
+        else:
+            graph_args = list(fwd)
+            model = Llama3(C, hidden, vocab, H, n_kv, L, eps).eval()
+            mod = import_from_model(model, fwd, ir_context=ir.Context.current)
         mod = TransformDriver(schedules=[convert_function_results("main")]).apply(mod)
 
         if args.fuse_halves:
@@ -260,7 +356,7 @@ def main():
                 )
 
         out = np.zeros((T, vocab), np.float16)
-        host_ins = [out, *(a.numpy() for a in fwd)]
+        host_ins = [out, *(a.detach().contiguous().numpy() for a in graph_args)]
         GPUMemoryManager.emit_memory_management_funcs(mod, host_inputs=host_ins)
         Runner.make_function_callable(mod, "main")
 
@@ -362,6 +458,14 @@ def main():
                 f"    f32 PyTorch reference next token: id {ref_id} -> "
                 f"{tok.decode([ref_id])!r}"
                 f"   {'MATCH' if ref_id == int(got[n_tok - 1].argmax()) else 'MISMATCH'}"
+            )
+            hf_ref = hf_reference_logits(args, L, ids)
+            hf_id = int(hf_ref[n_tok - 1].argmax())
+            hf_rel = np.abs(got[rows] - hf_ref).max() / (np.abs(hf_ref).max() + 1e-6)
+            print(
+                f"    transformers LlamaForCausalLM (f32) next token: {tok.decode([hf_id])!r}"
+                f"   {'MATCH' if hf_id == int(got[n_tok - 1].argmax()) else 'MISMATCH'}"
+                f"; logits rel={hf_rel:.6f}"
             )
 
         # Same guard as torch_mlir_block_gpu.py, and it matters more here: with N layers the
