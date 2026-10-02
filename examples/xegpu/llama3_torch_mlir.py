@@ -1,3 +1,7 @@
+# RUN: %PYTHON %s | FileCheck %s
+# REQUIRES: torch_mlir
+# CHECK: linalg.matmul
+
 """Generate the Llama-3 linalg payload via torch-mlir (instead of by hand).
 
 Lowers the PyTorch Llama-3 model in llama3_torch_model.py to linalg-on-tensors
@@ -25,14 +29,18 @@ _MODEL_FILE = _HERE / "llama3_torch_model.py"
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("-o", "--out", type=Path, default=None, help="save MLIR to this file")
+    ap.add_argument(
+        "-o", "--out", type=Path, default=None, help="save MLIR to this file"
+    )
     ap.add_argument(
         "--dialect",
         default="linalg-on-tensors",
         choices=["linalg-on-tensors", "torch", "tosa"],
         help="target dialect (default: linalg-on-tensors)",
     )
-    ap.add_argument("--f16", action="store_true", help="cast model to float16 before import")
+    ap.add_argument(
+        "--f16", action="store_true", help="cast model to float16 before import"
+    )
     args = ap.parse_args()
 
     mlir_text = import_from_file(
@@ -52,8 +60,14 @@ def main():
     counts = {}
     for line in mlir_text.splitlines():
         s = line.strip()
-        for op in ("linalg.matmul", "linalg.generic", "linalg.fill",
-                   "linalg.softmax", "linalg.transpose", "linalg.batch_matmul"):
+        for op in (
+            "linalg.matmul",
+            "linalg.generic",
+            "linalg.fill",
+            "linalg.softmax",
+            "linalg.transpose",
+            "linalg.batch_matmul",
+        ):
             if op + " " in s or s.startswith(op) or ("= " + op) in s:
                 counts[op] = counts.get(op, 0) + 1
     print("op histogram:", {k: counts[k] for k in sorted(counts)})

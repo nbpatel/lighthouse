@@ -1,71 +1,44 @@
-"""Generic XeGPU schedule for a torch-mlir-generated payload.
+"""XeGPU schedule for a torch-mlir Llama-3 payload.
 
-This is the schedule half of the torch-mlir Llama-3 flow, and the counterpart to the
-hand-written `llama3_schedule.py`. The difference: `llama3_schedule.py` is told what each
-op is, via a `kinds` list maintained alongside the hand-written payload. Here nothing is
-told to us -- `classify_payload` derives the whole plan by walking the imported IR, so any
-torch-mlir payload can be scheduled.
+Counterpart of the hand-written `llama3_schedule.py`. That schedule is told what each op is
+via a `kinds` list kept alongside the hand payload; here `classify_payload` derives the
+kernel plan by walking the imported IR, so any torch-mlir payload built from the same op
+classes can be scheduled.
 
-Structure of the flow (mirrors the nanoGPT payload/schedule/driver split):
-    payload   <- torch-mlir, from the PyTorch model in llama3_torch_model.py
+Flow (payload / schedule / driver split, as in nanoGPT):
+    payload   <- torch-mlir import of llama3_torch_model.py
     schedule  <- this file
-    driver    <- llama3_torch_mlir_check.py (CPU oracle) / torch_mlir_ffn_gpu.py (GPU)
+    driver    <- torch_mlir_llama_gpu.py
 
-How the schedule works:
+Steps:
 
-1. `classify_payload` walks the payload function and returns an ordered plan, one entry
-   per GPU kernel. Each entry names its op class and the ops it owns (`members`).
-   Op classes are derived, not declared:
-     matmul / batch_matmul   -- named contraction ops
-     contraction             -- a contraction torch-mlir emitted as a linalg.generic
-     reduction               -- reduces a single input (RMSNorm row sum, softmax max/sum)
-     elementwise             -- every iterator parallel
-   A reduction ITERATOR is not enough to tell a reduction from a contraction; see
-   `_classify_generic`.
+1. `classify_payload` returns one plan entry per GPU kernel: an op class plus the ops the
+   kernel owns. Classes are derived from the IR (matmul / batch_matmul / contraction /
+   reduction / elementwise / transpose / attention); see `_classify_generic` for why a
+   reduction iterator alone does not identify a reduction.
 
-2. Ops are GROUPED into kernels by dataflow: an elementwise op joins the preceding entry
-   when it consumes that entry's result. This is what puts a cast/activation in its
-   producer's kernel (Inductor's F1/F2/F4 shape) and what makes RMSNorm one kernel (which
-   for a reduction is mandatory, not an optimization -- its reduced intermediate cannot be
-   a kernel output).
+2. Ops are grouped into kernels by dataflow: an elementwise op joins the entry producing its
+   input when both share an iteration space. That puts casts and activations in their
+   producer's kernel and makes RMSNorm one kernel (mandatory: a reduced intermediate cannot
+   be a kernel output). The global `linalg-fuse-elementwise-ops` pass is deliberately not
+   used: it rewrites `linalg.matmul` into generics and loses the DPAS path.
 
-   NOTE: we deliberately do NOT run the global `linalg-fuse-elementwise-ops` pass.
-   It does reduce op count, but it absorbs neighbours INTO contractions and rewrites them
-   as generics -- on the full Llama block that turned 8 `linalg.matmul` + 2
-   `linalg.batch_matmul` into 4 matmul + 6 generic contractions, breaking the DPAS path
-   (which matches `linalg.matmul` / `xegpu.dpas`). Fusing through tiling instead is
-   layout-aware and preserves op identity.
+3. Each group is tiled into one work-group `scf.forall` through its LAST member with
+   `fuse_producers=True`, in topological order. Tiling through the last member pulls the
+   rest of the group in, `fuse_producers` also pulls in the `linalg.fill` accumulators
+   (one left outside a forall page-faults), and topological order keeps earlier kernels
+   from being re-absorbed into later ones.
 
-3. Each group is tiled into one work-group `forall`, in TOPOLOGICAL order, through its
-   LAST member, with `fuse_producers=True`. Every part of that is load-bearing:
-     - tiling through the last member pulls the group's earlier ops in (so the epilogue
-       lands in the producer's kernel);
-     - `fuse_producers` also pulls in each contraction's `linalg.fill` accumulator --
-       leaving it outside the forall causes a GPU page fault;
-     - topological order means an op's producers already sit inside foralls by the time we
-       reach it, so they cannot be re-absorbed. Without that ordering, tiling one matmul's
-       leaf consumer drags a second matmul into the same forall, producing a 2-dpas kernel
-       the single-dpas annotation cannot handle.
+4. One shared tail (vectorize, bufferize, outline), then per-kernel XeGPU layout anchors.
+   Vectorization is scoped to the foralls (`_vectorize_kernels_only`), a reduction gets
+   `promote-buffers-to-stack` after bufferization, and vector->xegpu runs per kernel so
+   only reductions get shared local memory.
 
-4. One shared tail for the whole module (it is op-class-agnostic: it processes every
-   `scf.forall`), then per-kernel XeGPU layout anchors. Three wrinkles:
-     - the tail is spelled out rather than taken from
-       `vectorize_bufferize_and_outline_gpu_func`, so that a reduction can have
-       `promote-buffers-to-stack` inserted after bufferization -- without it a spilled
-       accumulator becomes a global `gpu.alloc` that lowers to an unassignable scattered
-       `xegpu.store`;
-     - vectorization is scoped to the foralls, i.e. to the kernels, and must not run over
-       the host code around them (see `_vectorize_kernels_only`);
-     - vector->xegpu runs per kernel, because only a reduction may have its allocas moved
-       to shared local memory; doing that to an elementwise kernel creates `store_matrix`
-       paths that fail to lower.
-
-5. A payload may compute its result in PIECES -- RoPE writes a rotated half at a time --
-   which reads as `tensor.empty` -> `insert_slice` -> ... -> the output. Empty-tensor
-   elimination runs BEFORE tiling to point each piece's producer straight at its slice of
-   the output argument; see the loop in `generic_schedule`. `linalg.transpose` and
-   `tensor.concat` are the two remaining forms of real data movement with no kernel of
-   their own (concat is decomposed to `insert_slice`; transpose is still unhandled).
+5. Memref-level rewrites run in Python between bufferization and the tail to remove copy
+   kernels that cannot be avoided at the tensor level: transposes become strided views
+   (`replace_transpose_kernels_with_views`), GQA broadcasts fold into their readers
+   (`fold_gqa_broadcasts`), and RoPE's two half-writes are merged into one kernel
+   (`fuse_sibling_slice_writers` + `redirect_staged_destination_copies`).
 """
 
 from mlir import ir
@@ -103,14 +76,11 @@ from lighthouse.schedule.xegpu.elemwise_schedule import (
     xegpu_wg_annotation_for_elemwise_layer,
 )
 
-# The fused-attention XeGPU layouts, reused from the hand schedule in this same directory
-# instead of being copied: it is the only place that knows the Q/K/V/K^T/out anchor layouts
-# for the flash loop, and duplicating ~70 lines of layout constants would rot.
+# The fused-attention XeGPU layouts are shared with the hand schedule rather than copied.
 from llama3_schedule import xegpu_fa_annotation
 
-# Default elementwise geometry. wg_n is deliberately bounded: a row-only tile leaves the
-# full column width as one per-subgroup vector, which at FFN width (8192) overruns the
-# register file and faults.
+# Elementwise geometry. wg_n is bounded on purpose: a row-only tile at FFN width (8192)
+# makes one per-subgroup vector that overruns the register file.
 EW_PARAMS = {
     "wg_m": 128,
     "wg_n": 256,
@@ -119,18 +89,12 @@ EW_PARAMS = {
     "load_m": 8,
     "load_n": 16,
 }
-# Reduction geometry. wg_m/sg_m carry the row split (wg_n=sg_n=1) so the shared tail
-# derives (wg_rows/sg_rows)*NB_WORKITEMS threads; rss is the per-subgroup reduction step.
-# Mirrors the hand driver's ln_params.
+# Reduction geometry: wg_m/sg_m split the rows (wg_n = sg_n = 1), rss is the per-subgroup
+# reduction step.
 RED_PARAMS = {"wg_m": 64, "sg_m": 8, "wg_n": 1, "sg_n": 1, "rss": 16}
-# Fused-attention geometry, for the `d_head == 64` case (Llama-3's head dim). These are the
-# published-good values from `kernel_bench.py`'s attention branch, not invented here.
-#
-# The wg_m/sg_m/wg_n/sg_n quartet is NOT redundant with wg_rows/sg_rows: the shared tail's
-# `outline_gpu_function` derives the thread count as
-# (wg_m/sg_m)*(wg_n/sg_n)*NB_WORKITEMS, and (128/16)*(1/1)*16 = 128 reproduces exactly the
-# `num_subgroups * subgroup_size` the library attention schedule sets by hand. `wg_rows` and
-# `sg_rows` are what `xegpu_fa_annotation` reads, and `n_head` is its name for d_head.
+# Fused-attention geometry for d_head == 64 (values from kernel_bench.py). wg_m/sg_m/wg_n/sg_n
+# give the shared tail its thread count ((128/16)*(1/1)*16 = 128 = num_subgroups *
+# subgroup_size); wg_rows/sg_rows/n_head are what `xegpu_fa_annotation` reads.
 FA_PARAMS = {
     "wg_m": 128,
     "sg_m": 16,
@@ -138,18 +102,16 @@ FA_PARAMS = {
     "sg_n": 1,
     "wg_rows": 128,
     "sg_rows": 16,
-    "n_head": 64,  # d_head; the hand annotation's key name
+    "n_head": 64,  # d_head; the annotation's key name
     "inner_loop_tile_size": 64,
     "causal": False,
 }
 
-# Rounds of empty-tensor elimination to run before tiling. One round peels one level of an
-# `insert_slice` chain, so this needs to cover the longest slice-assembly in the payload:
-# RoPE assembles its result from 2 halves, and GQA/attention reshapes are no deeper.
+# Rounds of empty-tensor elimination before tiling. One round peels one level of an
+# `insert_slice` chain; RoPE's two halves are the deepest chain in the payload.
 _EMPTY_ELIM_ROUNDS = 4
 
-# linalg ops that become their own kernel. linalg.fill is excluded on purpose: it is an
-# accumulator that must be fused into its consumer.
+# linalg ops that get a kernel. linalg.fill is an accumulator and is fused into its consumer.
 _TILED_OPS = {
     "linalg.matmul": "matmul",
     "linalg.batch_matmul": "batch_matmul",
@@ -158,12 +120,9 @@ _TILED_OPS = {
 }
 _CONTRACTION_KINDS = {"matmul", "batch_matmul", "contraction"}
 
-# Metadata-only ops: they reshape or slice a tensor without computing anything, so they
-# get no kernel of their own -- but they DO carry dataflow. torch-mlir puts them between a
-# projection and its RoPE (`(x@wq).view(T,H,hs)` then half-split slices), so a grouping
-# pass that ignores them loses the producer/consumer link and splits what should be one
-# kernel. NOTE `linalg.transpose` is deliberately absent: it is REAL data movement, so it
-# gets its own kernel (kind "transpose") rather than being treated as a view.
+# Metadata-only ops: no kernel, but they carry dataflow (torch-mlir puts a view between a
+# projection and its RoPE), so grouping has to see through them. `linalg.transpose` is real
+# data movement and gets its own kernel instead.
 _VIEW_OPS = {
     "tensor.expand_shape",
     "tensor.collapse_shape",
@@ -177,14 +136,11 @@ _VIEW_OPS = {
 def _classify_generic(op) -> str:
     """Classify a linalg.generic as elementwise / reduction / contraction.
 
-    A reduction iterator alone does not tell these apart, and getting it wrong sends a
-    matmul down the RMSNorm path. torch-mlir frequently emits a projection as a generic
-    rather than a `linalg.matmul` -- `(x @ wq).view(T,H,hs)` folds the head reshape into
-    the contraction, giving a generic with a reduction iterator over a (T,H,hs) result.
-
-    Discriminator: a contraction reduces over a dimension shared by TWO OR MORE inputs
-    (it multiplies them together); a true reduction reduces a single input. DPS ops have
-    one init per result, so the input count is `operands - results`.
+    torch-mlir often emits a projection as a generic with a reduction iterator (the head
+    reshape folded into the contraction), so the iterator alone would send a matmul down the
+    RMSNorm path. A contraction reduces over a dim shared by two or more inputs; a true
+    reduction has a single input. DPS ops have one init per result, so inputs are
+    `operands - results`.
     """
     if "reduction" not in str(op.attributes["iterator_types"]):
         return "elementwise"
@@ -193,12 +149,7 @@ def _classify_generic(op) -> str:
 
 
 def get_payload_func_op(mod: ir.Module, func_name: str = "main"):
-    """The payload `func.func` as an IR op, for the passes that run in Python.
-
-    `get_payload_func` returns a transform HANDLE; the rewrites that the transform dialect
-    has no op for (see `fuse_rope_halves`, `replace_transpose_kernels_with_views`) walk the
-    IR directly and need the op itself.
-    """
+    """The payload `func.func` as an IR op, for the rewrites that run in Python."""
     for op in mod.body.operations:
         if op.operation.name == "func.func" and func_name in str(
             op.attributes["sym_name"]
@@ -208,12 +159,8 @@ def get_payload_func_op(mod: ir.Module, func_name: str = "main"):
 
 
 def _identity_maps(op) -> bool:
-    """True when every one of `op`'s indexing maps is the rank-preserving identity.
-
-    That is what makes an op inlinable into another op's body: one element in, one element
-    out, at the same index, so two such ops over the same shape share an iteration space
-    exactly rather than merely having the same extents.
-    """
+    """True when every indexing map of `op` is the identity, i.e. its body can be inlined
+    into another op over the same shape."""
     maps = ir.ArrayAttr(op.attributes["indexing_maps"])
     if not len(maps):
         return False
@@ -232,8 +179,7 @@ def _is_inlinable_elementwise(op, shape) -> bool:
         return False
     if not _identity_maps(op):
         return False
-    # An accumulating body (one that reads its `outs` element) cannot be inlined: the
-    # merged op supplies a fresh destination, so `%out` would no longer mean the same thing.
+    # A body that reads its `outs` element cannot be inlined into a fresh destination.
     body = op.regions[0].blocks[0]
     return len(list(body.arguments[-1].uses)) == 0
 
@@ -241,11 +187,9 @@ def _is_inlinable_elementwise(op, shape) -> bool:
 def _elementwise_tree(root, shape):
     """Collect the elementwise generics that compute `root`, plus the values they read.
 
-    Returns `(members, leaves)` with `members` in topological order (producers first) and
-    `leaves` the distinct values entering the tree from outside, or None if `root` is not
-    produced by an inlinable elementwise generic. An op is only taken as a member when ALL
-    of its uses are inside the tree -- otherwise something else reads it, so it has to stay
-    a real op and is treated as a leaf instead.
+    Returns `(members, leaves)` with members in topological order, or None if `root` is not
+    produced by an inlinable elementwise generic. An op is a member only when all its uses
+    are inside the tree; otherwise it stays a real op and is treated as a leaf.
     """
     if not isinstance(root, ir.OpResult):
         return None
@@ -274,7 +218,7 @@ def _elementwise_tree(root, shape):
         or all(u.owner in candidates for v in op.results for u in v.uses)
     ]
     member_set = set(members)
-    # Topological order: an op may only be emitted once everything it reads is emitted.
+    # Topological order: emit an op once everything it reads is emitted.
     ordered, emitted = [], set()
     while len(ordered) < len(member_set):
         progressed = False
@@ -296,19 +240,21 @@ def _elementwise_tree(root, shape):
     for op in ordered:
         n_in = len(op.operands) - len(op.results)
         for operand in list(op.operands)[:n_in]:
-            produced_here = isinstance(operand, ir.OpResult) and operand.owner in member_set
+            produced_here = (
+                isinstance(operand, ir.OpResult) and operand.owner in member_set
+            )
             if not produced_here and operand not in leaves:
                 leaves.append(operand)
     return ordered, leaves
 
 
 def _inline_elementwise_body(op, operand_scalars, scalars):
-    """Clone `op`'s body into the current insertion point, returning the scalar it yields.
+    """Clone `op`'s body at the current insertion point and return the scalar it yields.
 
-    `operand_scalars` are the scalars standing in for the op's tensor inputs, in order;
-    `scalars` maps an already-inlined member's RESULT to the scalar that computed it. The
-    bindings have no value-remapping clone, so each body op is recreated by name with
-    rewritten operands -- fine here because an inlinable body holds only scalar arithmetic.
+    `operand_scalars` stand in for the op's tensor inputs, in order; `scalars` maps
+    already-inlined members' results to their scalars. The bindings have no value-remapping
+    clone, so each body op is recreated by name; inlinable bodies hold only scalar
+    arithmetic, so that is enough.
     """
     body = op.regions[0].blocks[0]
     local = dict(scalars)
@@ -317,7 +263,7 @@ def _inline_elementwise_body(op, operand_scalars, scalars):
     for inner in body.operations:
         if inner.operation.name == "linalg.yield":
             return local.get(inner.operands[0], inner.operands[0])
-        # Indexing the attribute map gives NamedAttribute; ITERATING it gives bare names.
+        # Indexing the attribute map gives NamedAttribute; iterating it gives bare names.
         attrs = {
             (na := inner.attributes[i]).name: na.attr
             for i in range(len(inner.attributes))
@@ -338,7 +284,7 @@ def _static_unit_slice(ins):
     kdyn = ir.ShapedType.get_dynamic_size()
 
     def ints(name):
-        # These are DenseI64ArrayAttr (`array<i64: 0, 0>`), not ArrayAttr.
+        # DenseI64ArrayAttr (`array<i64: 0, 0>`), not ArrayAttr.
         return [int(v) for v in ir.DenseI64ArrayAttr(ins.attributes[name])]
 
     offsets, sizes, strides = (
@@ -352,14 +298,10 @@ def _static_unit_slice(ins):
 
 
 def _sibling_slice_chain(op, block_ops):
-    """Match a chain of two or more `tensor.insert_slice`s that write static, unit-stride,
-    pairwise-DISJOINT, equally shaped slices of one destination. `op` is the candidate LAST
+    """Match a chain of two or more `tensor.insert_slice`s writing static, unit-stride,
+    pairwise-disjoint, equally shaped slices of one destination. `op` is the candidate LAST
     insert; the chain is followed backwards through each insert's destination. Returns
-    `(chain, shape)` with `chain` in program order (the first insert's destination is the
-    common base, each next one's destination is the previous one's result), or None.
-
-    RoPE's two half-writes are the instance that motivated this, but nothing here is
-    RoPE-specific: any rank, any number of siblings, any slice positions.
+    `(chain, shape)` with `chain` in program order, or None. Nothing here is RoPE-specific.
     """
     if op.operation.name != "tensor.insert_slice":
         return None
@@ -371,11 +313,9 @@ def _sibling_slice_chain(op, block_ops):
         prev = dest.owner
         if prev.operation.name != "tensor.insert_slice" or prev not in block_ops:
             break
-        # An intermediate may only be read by the next insert and by `tensor.extract_slice`s
-        # -- after empty-tensor elimination there is one of those per later sibling,
-        # supplying its `outs` (that is the false serialization this rewrite exists to
-        # break). Anything else reading the half-assembled tensor would observe a value the
-        # merge does not preserve.
+        # An intermediate may only be read by the next insert and by the `extract_slice`s
+        # that supply later siblings' `outs`. Anything else would observe a value the merge
+        # does not preserve.
         if any(
             u.owner != cur and u.owner.operation.name != "tensor.extract_slice"
             for u in dest.uses
@@ -399,78 +339,39 @@ def _sibling_slice_chain(op, block_ops):
         for j in range(i + 1, len(boxes)):
             oi, oj = boxes[i][0], boxes[j][0]
             if not any(
-                oi[d] + shape[d] <= oj[d] or oj[d] + shape[d] <= oi[d] for d in range(rank)
+                oi[d] + shape[d] <= oj[d] or oj[d] + shape[d] <= oi[d]
+                for d in range(rank)
             ):
-                return None  # overlapping: the later write wins, a merge would not keep that
+                return None  # overlapping writes: the later one wins, a merge would not keep that
     return chain, shape
 
 
 def fuse_sibling_slice_writers(mod: ir.Module, func_name: str = "main") -> int:
-    """Merge sibling elementwise chains that write disjoint slices of one destination into ONE
-    multi-result `linalg.generic`. The motivating instance is RoPE, whose two half-chains this
-    turns into the hand payload's `Builder.rope` form; the matcher itself is shape-agnostic.
+    """Merge sibling elementwise chains that write disjoint slices of one destination into
+    ONE multi-result `linalg.generic`.
 
-    The RoPE story, kept for the record:
+    Motivation: RoPE writes `out[:, :half]` and `out[:, half:]` as two independent chains,
+    which costs 2 kernels per RoPE against Inductor's 1. Grouping cannot fix it (the lower
+    half is not a producer of the upper one, so tiling through the last member leaves it
+    outside every kernel), and `transform.loop.fuse_sibling` rejects the two tiled foralls
+    on a false dominance dependence through the `insert_slice` chain. A single two-result
+    generic over the same `(rows, half)` space is ordinary elementwise and tiles like any
+    other op; it is the form the hand payload's `Builder.rope` already uses.
 
-    `_rope` computes `out[:, :half] = lo*cos - hi*sin` and `out[:, half:] = hi*cos + lo*sin`.
-    torch-mlir emits that as two independent elementwise chains writing DISJOINT COLUMN
-    SLICES of one destination, which costs 2 kernels per RoPE against Inductor's 1 -- the
-    last item of the kernel-count gap, and the one no payload spelling fixes (`cat` becomes
-    `tensor.concat`, which is data movement with no tiling interface; `flip` becomes a
-    `tensor.extract` GATHER, which does not block-load; `stack` becomes `concat` again --
-    all three measured, all worse).
+    Runs on tensor-level IR after empty-tensor elimination (so the destination is already
+    the real output buffer) and before `classify_payload`. Must be paired with
+    `redirect_staged_destination_copies`: one-shot bufferization cannot prove the two
+    destination slices disjoint and stages the second one through a host-copied alloc,
+    which faults on device memory.
 
-    GROUPING cannot fix it either, which is why it outlived the MERGE rule: a group is tiled
-    through its LAST member with `fuse_producers`, and the lower half is not a producer of
-    the upper one, so it would be left outside every kernel. Nor can the two tiled `forall`s
-    be fused as siblings: the upper half's `shared_outs` chains through the lower half's
-    `tensor.insert_slice`, so `transform.loop.fuse_sibling` rejects the pair on dominance --
-    a FALSE dependence, since the two write disjoint columns.
-
-    So build the form the HAND payload already uses (`Builder.rope`): ONE generic with TWO
-    results, each going to its own destination slice. Both halves read the same leaves over
-    the same `(rows, half)` iteration space, so the merged op is ordinary elementwise and
-    tiles like any other -- no reversal map anywhere, hence no gather.
-
-    Runs on the tensor-level IR AFTER empty-tensor elimination (so the destination is already
-    rooted at the real output buffer) and BEFORE `classify_payload`, so the plan simply sees
-    one op and needs no special case. Returns the number of RoPEs fused.
-
-    **MUST BE PAIRED WITH `redirect_staged_destination_copies`** (the driver flag does both).
-    One-shot bufferization will not write both results in place: it cannot prove that
-    `%dst[0, 0][rows, half]` and `%dst[0, half][rows, half]` are disjoint SUBSETS of one
-    buffer, so it keeps the first in place and stages the second through an alloc bracketed by
-    host `memref.copy`s -- host accesses over device memory, which fault (masked by libocloc as
-    "longjmp causes uninitialized stack frame"). That companion pass undoes the staging after
-    bufferization. The hand payload never hits this because it writes its two strided
-    destination views at MEMREF level and never asks the analysis to prove anything.
-
-    MEASURED DEAD ENDS, do not retry:
-      * `transform.loop.fuse_sibling` on the two TILED foralls. Bounds match, but `isOpSibling`
-        rejects the pair -- the upper half's `shared_outs` chains through the lower half's
-        `tensor.insert_slice`, so a user of the target's result is not dominated by the source.
-        That dependence is FALSE (disjoint columns) but the check is structural.
-      * letting `classify_payload` group all 6 RoPE ops, which it does on its own once
-        elimination runs before classification (it reports a tidy `members=6` and "tiled OK").
-        That plan is INVALID: a group is tiled through its LAST member with `fuse_producers`
-        and the lower half is not a producer of the upper one, so half 0 is left outside every
-        kernel and the run dies in `Runner` with "Failure while creating the ExecutionEngine".
-      * a rank-3 `(rows, 2, half)` single-result form, which would suit bufferization (one
-        destination) and needs no reversal map -- the half is selected by `linalg.index(1)` +
-        `arith.select`, how Inductor's Triton spells it. It moves the problem into XeGPU: the
-        tile stays rank 3 (`d1` extent 2, so unit-extent folding has nothing to fold) and a 3-D
-        `xegpu.tensor_desc` is not distributable; tiling `d1` to 1 puts the unit dim in the
-        MIDDLE (the store-clipping case `_transpose_block_axis` exists to avoid), and blocking
-        `d1` alone leaves 2 work-groups.
+    Returns the number of chains fused.
     """
     func = get_payload_func_op(mod, func_name)
     block = func.regions[0].blocks[0]
     fused = 0
-    # Candidates are visited LAST-insert-first so a chain is taken whole rather than as an
-    # earlier sub-chain that would leave its tail sibling unmerged. Each merge ERASES ops
-    # that sit earlier in the block, i.e. later in this reversed walk, so the op list is
-    # re-snapshotted after every merge rather than iterated stale: touching an erased
-    # OpView is a use-after-free (measured as a silent segfault at 16 toy layers).
+    # Visit last-insert-first so a chain is taken whole rather than as a sub-chain. Each
+    # merge erases ops, so the op list is re-snapshotted after every merge: touching an
+    # erased OpView is a use-after-free.
     progress = True
     while progress:
         progress = False
@@ -500,7 +401,7 @@ def _fuse_one_sibling_chain(block, block_ops, op) -> bool:
             for i in range(len(trees))
             for j in range(i + 1, len(trees))
         ):
-            return False  # shared work: merging would duplicate it, so leave it alone
+            return False  # shared work: merging would duplicate it
         roots = [members[-1] for members, _ in trees]
         result_type = roots[0].results[0].type
         if any(r.results[0].type != result_type for r in roots):
@@ -511,17 +412,13 @@ def _fuse_one_sibling_chain(block, block_ops, op) -> bool:
             leaves.extend(v for v in tree_leaves if v not in leaves)
         last = chain[-1]
         n_out = len(chain)
-        # Build before the LAST insert, not the first: a later sibling's own leaf
-        # `extract_slice`s sit between the inserts, so anchoring on the first insert would
-        # put the merged op above operands it reads ("operand #4 does not dominate this
-        # use"). The earlier inserts are then moved down past it, below.
+        # Insert before the LAST insert: a later sibling's leaf `extract_slice`s sit between
+        # the inserts, so anchoring on the first would place the merged op above operands it
+        # reads. The earlier inserts are moved down past it below.
         with ir.InsertionPoint(last), ir.Location.unknown():
-            # The `outs` must be the destination's own SLICES, not fresh `tensor.empty`s.
-            # With empties, empty-tensor elimination redirects only the FIRST one onto the
-            # output argument -- a later insert's destination is an earlier insert's RESULT,
-            # and elimination cannot see through that -- so that sibling writes a temporary
-            # that a HOST `insert_slice` then copies over device memory, which faults
-            # ("longjmp causes uninitialized stack frame").
+            # `outs` must be slices of the destination, not fresh `tensor.empty`s: elimination
+            # only redirects the first empty onto the output, and the other sibling would then
+            # be copied in by a host `insert_slice` over device memory, which faults.
             dest_base = chain[0].operands[1]
             outs = [
                 tensor.ExtractSliceOp(
@@ -566,14 +463,13 @@ def _fuse_one_sibling_chain(block, block_ops, op) -> bool:
                 ir.Operation.create("linalg.yield", operands=yields)
         for i, ins in enumerate(chain):
             ins.operands[0] = merged.results[i]
-        # The old chains are dead now, but nothing runs DCE before `classify_payload`, and a
-        # dead linalg op would still be classified into the plan as its own kernel.
+        # The old chains are dead, but nothing runs DCE before `classify_payload`, which
+        # would still plan a kernel for them.
         all_members = [m for members, _ in trees for m in members]
         for member in reversed(all_members):
             if all(len(list(v.uses)) == 0 for v in member.results):
                 member.operation.erase()
-        # The chains' old `outs` slices die with them; drop them so the earlier inserts can
-        # move below the merged op without leaving a use above its definition.
+        # Drop the dead `outs` slices so the earlier inserts can move below the merged op.
         for op_to_drop in list(block.operations):
             if op_to_drop.operation.name == "tensor.extract_slice" and all(
                 len(list(v.uses)) == 0 for v in op_to_drop.results
@@ -584,7 +480,7 @@ def _fuse_one_sibling_chain(block, block_ops, op) -> bool:
         return True
 
 
-# The RoPE-specific name this rewrite was introduced under; the drivers still use it.
+# The name the drivers use.
 fuse_rope_halves = fuse_sibling_slice_writers
 
 
@@ -592,21 +488,19 @@ def classify_payload(mod: ir.Module, func_name: str = "main") -> list[dict]:
     """Walk the payload function and return an ordered plan, one entry per kernel.
 
     Entry fields:
-      kind    -- matmul / batch_matmul / contraction / reduction / elementwise
+      kind    -- matmul / batch_matmul / contraction / reduction / elementwise / transpose /
+                 attention
       members -- op names owned by this kernel, in program order; the LAST one is tiled
+      handles -- (op name, ordinal in IR order) per member, for `generic_schedule`
       mnk     -- (M, N, K) for contractions, for per-shape tile selection
       shape   -- the kernel's result shape
     """
     plan: list[dict] = []
-    # value -> index of the plan entry that produces it, so an absorb candidate can be
-    # checked for operands coming from a DIFFERENT kernel (see the foreign-operand rule).
+    # value -> index of the plan entry producing it (for the join and merge rules).
     owner: dict = {}
-    # How many ops of each name have been seen, so every member can record its ORDINAL in
-    # IR order. `generic_schedule` needs that: it matches one handle per op name and must
-    # index by IR position, not pop in plan order -- an absorbed member (attention swallows
-    # the K^T transpose) is consumed at its GROUP's position, which can be later than the
-    # transpose's own position in the IR, and popping then hands other transposes the wrong
-    # handle and therefore the wrong tile params.
+    # Per-op-name ordinal in IR order. `generic_schedule` indexes handles by IR position,
+    # not plan order: an absorbed member (attention swallows the K^T transpose) is consumed
+    # at its group's position, which can be later than the op's own position.
     seen: dict = {}
     for op in mod.body.operations:
         if op.operation.name != "func.func":
@@ -620,8 +514,7 @@ def classify_payload(mod: ir.Module, func_name: str = "main") -> list[dict]:
                 operands = {o.operands[i] for i in range(len(o.operands))}
 
                 if name in _VIEW_OPS:
-                    # No kernel, but keep the dataflow chain intact so the ops on the far
-                    # side of a reshape still group with their producer.
+                    # No kernel, but keep the dataflow chain intact across reshapes.
                     if plan and operands & plan[-1]["produced"]:
                         plan[-1]["produced"] |= results
                         plan[-1]["reads"] |= operands
@@ -642,43 +535,21 @@ def classify_payload(mod: ir.Module, func_name: str = "main") -> list[dict]:
                 shape = (
                     ir.ShapedType(o.results[0].type).shape if len(o.results) else None
                 )
-                # Group an elementwise op into the preceding kernel when it consumes that
-                # kernel's result AND iterates the same rank: puts casts/activations in
-                # their producer's kernel, and makes a reduction plus its normalize step a
-                # single kernel.
-                #
-                # The rank test matters. A group is tiled as ONE iteration space, so
-                # merging ops of different rank is wrong in principle -- and it breaks in
-                # practice: folding RoPE's rank-3 head view `(T,H,hs/2)` into a rank-2
-                # projection leaves a `vector.contract` that `convert-vector-to-xegpu`
-                # will not turn into an `xegpu.dpas`, so the matmul annotation finds
-                # nothing to anchor. Keeping them separate gives the projection a real
-                # DPAS kernel and RoPE its own (which is also Inductor's F1/F2 shape).
-                # Ops only share a kernel when they share an ITERATION SPACE, so the
-                # shapes must match exactly -- rank alone is not enough. RoPE reshapes a
-                # (T,C) projection to (T*H, hs): same rank, different extents, and fusing
-                # those into the matmul's forall leaves a `vector.contract` that
-                # `convert-vector-to-xegpu` will not turn into an `xegpu.dpas`, so the
-                # matmul annotation finds nothing to anchor.
-                #
-                # A reduction is exempt: it changes shape by definition (its consuming
-                # elementwise op is full-rank while the reduced value is not), and grouping
-                # them is mandatory since the reduced intermediate cannot be a kernel
-                # output. There the iteration space is the OUTPUT's, with the reduction
-                # fused in as a producer (exactly `_tile_one_rmsnorm`).
+                # Grouping rule: an elementwise op joins the preceding kernel when it
+                # consumes that kernel's result and has the SAME result shape, i.e. shares
+                # its iteration space. Fusing different spaces into one forall leaves a
+                # `vector.contract` that never becomes an `xegpu.dpas` (RoPE's head view
+                # folded into a projection). A reduction is exempt: its consumer is
+                # full-rank by definition and must join it, since the reduced intermediate
+                # cannot be a kernel output.
                 prev = plan[-1] if plan else None
 
-                # ATTENTION absorbs a whole region, not just an epilogue. A batch_matmul
-                # opens an "attention" group, which then swallows everything downstream of
-                # it -- the scale multiply, the decomposed softmax's reductions and
-                # elementwise ops, and the SECOND contraction -- because the flash rewrite
-                # needs `QK^T -> softmax -> @V` inside ONE forall to replace as a unit. The
-                # shape/rank test used for ordinary grouping deliberately does not apply
-                # here: the region's shapes legitimately change along the chain (scores are
-                # (.., T, T) while the output is (.., T, hs)).
-                #
-                # The group closes once it holds both contractions AND stops receiving
-                # elementwise consumers, which is what ends it at the output cast.
+                # Attention absorbs a whole region: a batch_matmul opens an "attention"
+                # group that swallows everything downstream (scale, softmax reductions and
+                # elementwise ops, the second contraction), because the flash rewrite needs
+                # `QK^T -> softmax -> @V` inside ONE forall. Shapes legitimately change
+                # along the chain, so the shape test does not apply. The group closes once
+                # it holds both contractions and stops receiving elementwise consumers.
                 if prev is not None and prev["kind"] == "attention":
                     absorb = operands & prev["produced"] and (
                         kind in ("elementwise", "reduction")
@@ -697,35 +568,13 @@ def classify_payload(mod: ir.Module, func_name: str = "main") -> list[dict]:
                             prev["n_contractions"] += 1
                         continue
                 if kind == "batch_matmul":
-                    # A K^T transpose feeding the region gets NO kernel of its own:
-                    # `replace_with_fused_attention` transposes K itself, so once the P@V
-                    # contraction is replaced the explicit transpose is dead and is DCE'd.
-                    # (Measured: the library `fused_attention_schedule` lowers a torch-mlir
-                    # attention payload to 1 kernel with 0 transposes.) Leaving it as its own
-                    # entry would emit a pointless copy kernel; absorbing it lets
-                    # `fuse_producers` pull it into the region where it dies.
-                    #
-                    # ONLY a K^T-shaped one, though: a permutation that swaps just the last
-                    # two dims. A Llama block also has a HEAD-MAJOR transpose feeding
-                    # attention -- `q.view(T,H,hs).transpose(0,1)`, permutation [1,0,2] --
-                    # and absorbing that one is wrong, because it leaves Q in (T,H,hs) while
-                    # the flash op requires the head dim OUTERMOST: it rank-reduces the Q
-                    # slice by dropping dim 0, which on a (128,1,64) token-major slice drops
-                    # the 128 and builds the invalid
-                    #   extract_slice ... sizes [128,1,64] : tensor<128x1x64xf16> -> tensor<1x64xf16>
-                    # that later asserts in `getDroppedDims` ("expected unit dim").
-                    # The transpose is found by OWNERSHIP of an operand, not by being the
-                    # entry immediately before. In a whole block it is not: the plan reads
-                    # `transpose (4,64,256)` = K^T, `transpose (4,256,64)` = the head-major Q
-                    # transpose, then attention -- so a `prev`-only test sees only the
-                    # head-major one, correctly refuses it, and misses the K^T entirely. The
-                    # K^T then keeps a kernel, stays LIVE inside the region, and the flash op
-                    # is handed K^T as its `k`: it reads the shape as `(n_ctx=64, d_head=256)`
-                    # instead of `(256, 64)`, so the flash loop collapses to a single
-                    # iteration over a 64x64 corner of K and V -- silently wrong, and the
-                    # extra full-width `tensor_desc<64x256xf16>` load then shifts the
-                    # annotation's positional Q/K/V assignment and fails as "TensorDesc shape
-                    # is not distributable with the layout".
+                    # A K^T transpose feeding the region gets no kernel of its own:
+                    # `replace_with_fused_attention` transposes K itself, so the explicit
+                    # transpose is dead after the rewrite. Only a transpose of the last two
+                    # dims qualifies; the head-major `[1,0,2]` transpose must keep its
+                    # kernel, because the flash op needs the head dim outermost. It is found
+                    # by ownership of an operand, not by plan adjacency: in a full block the
+                    # head-major transpose sits between K^T and the attention entry.
                     absorbed_members: list = []
                     absorbed_handles: list = []
                     absorbed_results: list = []
@@ -738,10 +587,8 @@ def classify_payload(mod: ir.Module, func_name: str = "main") -> list[dict]:
                             and not cand.get("absorbed")
                             and _is_minor_transpose(cand.get("permutation"))
                         ):
-                            # Marked rather than popped: popping renumbers `plan`, which
-                            # would invalidate every `owner` index above it and misattribute
-                            # kinds in the JOIN rule below. Absorbed entries are dropped at
-                            # the end, once `owner` is dead.
+                            # Marked, not popped: popping renumbers `plan` and invalidates
+                            # every `owner` index above it.
                             cand["absorbed"] = True
                             absorbed_members = cand["members"]
                             absorbed_handles = cand["handles"]
@@ -757,12 +604,9 @@ def classify_payload(mod: ir.Module, func_name: str = "main") -> list[dict]:
                             "members": absorbed_members + [name],
                             "handles": absorbed_handles + [(name, ordinal)],
                             "member_results": absorbed_results + [set(results)],
-                            # A COPY: `produced` grows as view ops chain off this entry, and
-                            # `member_results` must keep each member's own results.
+                            # A copy: `produced` grows as view ops chain off this entry.
                             "produced": set(results),
-                            # Every value the group's members READ. The reduction absorb below
-                            # walks this to find the head of a chain that is more than one op
-                            # deep.
+                            # Every value the group's members read.
                             "reads": set(operands).union(
                                 *[h["reads"] for h in absorbed_heads]
                             )
@@ -775,28 +619,12 @@ def classify_payload(mod: ir.Module, func_name: str = "main") -> list[dict]:
                         owner[v] = len(plan) - 1
                     continue
 
-                # An elementwise op may not join the preceding kernel if it reads results
-                # from TWO different contraction kernels. Such an op is a JOIN, and
-                # absorbing it over-fuses: the group is
-                # tiled through its last member with `fuse_producers`, so a residual add
-                # like `h + o` -- h from the attention output projection, o from the FFN --
-                # drags BOTH matmul chains into one forall. That kernel then holds two
-                # k-loops and two `vector.contract`s, and the single-DPAS mlp annotation
-                # cannot take it ("requires exactly one target value handle (got 2)").
-                # This is the same over-fusion the leaf-consumer experiments hit; see the
-                # "Composition findings" note about tiling directly in topological order.
-                #
-                # Two earlier, WRONGER versions of this rule, for the record: refusing on
-                # ANY foreign operand split each RoPE from 4 kernels to 6 (a foreign
-                # elementwise operand is harmless), and refusing on ONE foreign contraction
-                # broke RoPE outright ("conversion failed for builtin.unrealized_conversion_cast"),
-                # because `hi*sin` reads the projection just as `lo*cos` does.
-                # Count DISTINCT kernels holding a contraction that this op reads from.
-                # Two or more means it JOINS two contraction chains -- the residual add
-                # `h + o`, with h from the attention output projection and o from the FFN.
-                # One is the ordinary case and must stay fusable: both RoPE halves read the
-                # SAME projection (`lo*cos` and `hi*sin`), and a matmul epilogue reads its
-                # own matmul.
+                # JOIN rule: an elementwise op reading results of two or more DIFFERENT
+                # contraction kernels (the residual add `h + o`) must not join either.
+                # Fusing it would drag both matmul chains into one forall, and the
+                # single-DPAS annotation rejects two `vector.contract`s. One contraction
+                # source is the normal case (a matmul epilogue, or both RoPE halves reading
+                # the same projection) and must stay fusable.
                 contraction_srcs = {
                     owner[v]
                     for v in operands
@@ -805,36 +633,15 @@ def classify_payload(mod: ir.Module, func_name: str = "main") -> list[dict]:
                 }
                 foreign = len(contraction_srcs) >= 2
 
-                # MERGE rule: an elementwise op reading TWO OR MORE elementwise kernels that
-                # share its iteration space merges those entries into one kernel, with itself
-                # as the new last member.
-                #
-                # Needed because the ordinary grouping rule only looks at `plan[-1]`, so it
-                # can only ever extend the entry that happens to sit immediately before. RoPE
-                # is the case that costs: `out[:, :half] = lo*cos - hi*sin` emits
-                #   mulf(lo,cos)   mulf(hi,sin)   subf
-                # in that order, and `mulf(hi,sin)` does NOT read `mulf(lo,cos)`'s result (it
-                # reads the projection and the sin table), so it opens its own entry; the
-                # `subf` then joins THAT one and nothing ever goes back for `mulf(lo,cos)`,
-                # which is left as a kernel computing a value its neighbour immediately
-                # consumes. Merging gives one kernel per RoPE half instead of two: 4 -> 2 per
-                # RoPE, i.e. -4 kernels on a Llama block.
-                #
-                # Only ELEMENTWISE sources, and only on the same iteration space. Two
-                # CONTRACTION sources are the JOIN case below and must NOT be merged -- fusing
-                # there clones a matmul chain into the kernel and the single-DPAS annotation
-                # rejects the two `vector.contract`s. A transpose/reduction/attention source is
-                # excluded for the same reason: the merged group is tiled as one forall through
-                # its last member, which is only valid when every member shares that space.
-                # The merge target is the LATEST source, never the earliest: the combined group
-                # then sits at a plan position after all of its producers, which is what keeps
-                # the tiling order topological (tile a group before its producers are in
-                # foralls and `fuse_producers` clones them, leaving the originals live outside
-                # every kernel). Entries are MARKED absorbed rather than removed, because
-                # removing renumbers `plan` and invalidates every `owner` index above it.
-                # If a merged member's result turns out to escape, `_split_multi_output_groups`
-                # splits the group again, so a wrong merge degrades to today's behaviour rather
-                # than miscompiling.
+                # MERGE rule: an elementwise op reading two or more ELEMENTWISE kernels on
+                # its own iteration space merges them into one kernel, with itself as the
+                # last member. The grouping rule only extends `plan[-1]`, so RoPE's
+                # `mulf(lo,cos); mulf(hi,sin); subf` would otherwise leave `mulf(lo,cos)` as
+                # its own kernel. Only elementwise sources: contraction sources are the join
+                # case, and transpose/reduction/attention sources do not share the space.
+                # The target is the LATEST source so tiling order stays topological; the
+                # others are marked absorbed, not removed (removing renumbers `plan`). A
+                # merge whose member escapes is undone by `_split_multi_output_groups`.
                 if kind == "elementwise" and not foreign:
                     srcs = sorted({owner[v] for v in operands if v in owner})
                     if len(srcs) >= 2 and all(
@@ -871,37 +678,11 @@ def classify_payload(mod: ir.Module, func_name: str = "main") -> list[dict]:
                             owner[v] = target_idx
                         continue
 
-                # NOT DONE, and recorded because it looks free and is not: absorbing the
-                # elementwise op that FEEDS a reduction. RMSNorm's leading `x*x` is its own
-                # entry -- it is the head of the reduction chain, not part of it, so nothing
-                # groups it -- which costs a kernel per norm (2 on a Llama block) for a value
-                # nobody reads, since `_tile_one_reduction` fuses `x*x` in as a producer
-                # anyway. Absorbing it into the reduction group DOES give 27 kernels instead
-                # of 28, but it then breaks tiling: with `x*x` inside the forall,
-                # `_tile_one_reduction`'s second `fuse_elementwise_producers(tiled_red,
-                # red_loop)` finds it among the reduction's traced producers and fails with
-                # "could not find next producer to fuse into container". Fixing that means
-                # reworking the reduction's inner fusion, which is the most delicate path in
-                # this schedule, for two kernels out of 28 -- the transpose/GQA (+6) and RoPE
-                # (+6) items are worth far more. See the kernel-count table in §3b of
-                # llama3_torch_mlir_optimization_plan.md.
-                # Note it only ever fires for the FIRST norm anyway: the second norm's `x*x`
-                # is absorbed into the O-projection group during the walk and only becomes its
-                # own entry later, in `_split_multi_output_groups`.
-                # A JOIN entry must stay a SINGLE op, so it cannot be joined either. A join is
-                # tiled with `fuse_producers=False` (that is the whole point: fusing would
-                # clone a foreign matmul in), and a group is tiled through its LAST member --
-                # so any earlier member of a join group is never pulled into the forall and
-                # stays live outside every kernel. It then reaches LLVM translation as a
-                # `linalg.generic` over memrefs and fails as "LLVM Translation failed for
-                # operation: builtin.unrealized_conversion_cast" (the cast that feeds it), which
-                # surfaces as `RuntimeError: Failure while creating the ExecutionEngine`.
-                # This is not hypothetical: with the norm in f32 the LAST block's residual add
-                # `h + o` is a join whose ONLY consumer is the final norm's `x.float()` extf, so
-                # the extf grouped into it and the add was left behind. It bites only there --
-                # an intermediate block's output is read by both the next norm and the next
-                # residual add, so two results escape and `_split_multi_output_groups` already
-                # separates those.
+                # A join entry stays a single op: it is tiled with `fuse_producers=False`,
+                # so an earlier member would never enter the forall and would be left live
+                # outside every kernel (LLVM translation then fails on a stray
+                # `unrealized_conversion_cast`). The last block's residual add is exactly
+                # that case: its only consumer is the final norm's `extf`.
                 if (
                     kind == "elementwise"
                     and prev is not None
@@ -933,19 +714,13 @@ def classify_payload(mod: ir.Module, func_name: str = "main") -> list[dict]:
                     "member_results": [set(results)],
                     "produced": set(results),
                     "reads": set(operands),
-                    # A JOIN: an elementwise op reading results of other CONTRACTION kernels
-                    # (the residual adds). It gets its own kernel, and it must be tiled with
-                    # `fuse_producers=False` -- it has no members of its own to fuse, and
-                    # fusing is exactly what would CLONE a foreign matmul into it. Without
-                    # this the "elementwise" kernel ends up holding a `vector.contract` and
-                    # gets elementwise layouts, which fails as
-                    # "'xegpu.load_nd' op TensorDesc shape is not distributable".
+                    # A join gets its own kernel and is tiled with `fuse_producers=False`:
+                    # fusing would clone a foreign matmul into an elementwise kernel.
                     "join": kind == "elementwise" and foreign,
                 }
                 if kind == "transpose":
-                    # Kept because it decides whether the attention region may absorb this
-                    # transpose -- see the absorb rule above.
-                    # `permutation` is a DenseI64ArrayAttr, so iterating gives plain ints.
+                    # Decides whether attention may absorb this transpose. DenseI64ArrayAttr
+                    # iterates as plain ints.
                     entry["permutation"] = list(o.attributes["permutation"])
                 plan.append(entry)
                 for v in results:
@@ -961,13 +736,11 @@ def classify_payload(mod: ir.Module, func_name: str = "main") -> list[dict]:
 
 
 def _escapes(value, produced) -> bool:
-    """True if `value` is read by an op that is not part of the same kernel group.
+    """True if `value` is read by an op outside its kernel group.
 
-    "Part of the group" is decided by results, not by identity: `produced` holds every value
-    the group's members and their chained view ops define, so a consumer whose results are
-    all in `produced` is inside the group. An op with NO results (the function's
-    `tensor.insert_slice`/return path) always counts as outside -- that is the group's real
-    output.
+    `produced` holds every value the group's members and their chained view ops define, so
+    a consumer whose results are all in `produced` is inside the group. An op with no
+    results (the function's `insert_slice`/return path) always counts as outside.
     """
     for use in value.uses:
         owner = use.owner
@@ -978,33 +751,21 @@ def _escapes(value, produced) -> bool:
 
 
 def _absorb_reduction_heads(plan: list[dict]) -> list[dict]:
-    """Fold the elementwise HEAD of a reduction chain into that reduction's group.
+    """Fold the elementwise head of a reduction chain (`x.float()`, `x*x`) into the
+    reduction's group.
 
-    RMSNorm reads `xf = x.float()`, then `xf*xf`, then sums. Those two ops share the
-    reduction's iteration space and feed nothing else, but neither can join a group during the
-    walk: `x*x` heads the chain so there is no preceding kernel to join, and the reduction
-    itself opens a new entry rather than extending them. Left alone they are 2 kernels per norm
-    -- 4 per block -- computing values that `_tile_one_reduction` re-fuses as producers anyway,
-    so nothing ever reads what those kernels write.
-
-    Run as a POST-PASS, after `_split_multi_output_groups`, because the second norm's heads are
-    not their own entries during the walk at all: `h` comes from the O-projection kernel, so the
-    `extf` joins THAT group by the ordinary elementwise rule and only becomes a separate entry
-    when the split pass cuts the group at its first escaping result. A walk-time absorb catches
-    the first norm and misses the second.
-
-    All-or-nothing per norm, and that is not a simplification: absorbing only the `extf` would
-    leave `x*x` a separate kernel READING `xf`, so `xf` would escape the group and
-    `_split_multi_output_groups` would cut it straight back out.
+    The head cannot join during the walk: nothing precedes it, and the reduction opens a new
+    entry rather than extending it. Left alone it is a kernel per norm computing a value that
+    `_tile_one_reduction` re-fuses as a producer anyway. Runs after
+    `_split_multi_output_groups`, because the second norm's head is only cut out of the
+    O-projection group there. All-or-nothing per norm: absorbing only the cast would make it
+    escape, and the split pass would cut it back out.
     """
     absorbed: set = set()
     for j, red in enumerate(plan):
         if red["kind"] != "reduction":
             continue
-        # Candidate heads: earlier elementwise entries this group reads, on its own iteration
-        # space. `reads` is the union over ALL members, which is what makes the direct test
-        # enough here -- the normalize member reads `xf`, so the cast is a direct hit even
-        # though only `x*x` touches the reduction op itself.
+        # Earlier elementwise entries this group reads, on its own iteration space.
         heads = [
             i
             for i, cand in enumerate(plan[:j])
@@ -1016,10 +777,8 @@ def _absorb_reduction_heads(plan: list[dict]) -> list[dict]:
         ]
         if not heads:
             continue
-        # Refuse if a head's result is read from OUTSIDE the merged group: the group is tiled
-        # through its last member, so an escaping earlier member would be cloned in and left
-        # live outside every kernel (the orphan that fails LLVM translation as a stray
-        # `builtin.unrealized_conversion_cast`).
+        # Refuse if a head's result is read from outside the merged group: it would be cloned
+        # in and left live outside every kernel.
         produced = set(red["produced"]).union(*[plan[i]["produced"] for i in heads])
         if any(
             _escapes(v, produced)
@@ -1040,26 +799,14 @@ def _absorb_reduction_heads(plan: list[dict]) -> list[dict]:
 
 
 def _split_multi_output_groups(plan: list[dict]) -> list[dict]:
-    """Split any group that has more than one ESCAPING result.
+    """Split any group with more than one escaping result.
 
-    Every group is tiled through its LAST member with `fuse_producers`, which only makes a
-    correct kernel when that member's result is the one value the rest of the payload reads.
-    A group with two escaping results breaks it: tile-and-fuse CLONES producers into the new
-    loop rather than moving them, so the earlier escaping member's original op stays live
-    OUTSIDE any forall, reaches LLVM lowering as a `linalg.matmul` over memrefs and fails
-    with "expected add/mul op in the body".
-
-    A Llama block produces exactly that. The second RMSNorm's `x*x` consumes the residual add
-    `h = x + attn`, has the same shape, and so joins the output-projection group by the
-    ordinary elementwise rule -- but `h` itself is read by the FINAL residual add and by the
-    norm's own rescale, so both `h` and `x*x` escape. Splitting after `h` leaves the
-    projection group ending at its real output and gives `x*x` its own kernel, which is
-    exactly the shape the FIRST RMSNorm already has (there `x` is a function argument, so
-    `x*x` never had a group to join). `_tile_one_reduction` then fuses it back in as a
-    producer, as it already does for the first norm.
-
-    Attention is exempt: the flash rewrite replaces the whole region as a unit, and its
-    intermediates are dead afterwards rather than escaping.
+    Tile-and-fuse CLONES producers into the new loop, so a group is only correct when its
+    last member's result is the one value the rest of the payload reads. Otherwise the
+    earlier escaping member's original op stays live outside every forall and fails LLVM
+    lowering. A Llama block hits this: the second norm's `x*x` joins the O-projection group,
+    but the residual `h` is also read by the final add, so both escape. Attention is exempt:
+    its intermediates die with the flash rewrite.
     """
     out: list[dict] = []
     for entry in plan:
@@ -1072,7 +819,7 @@ def _split_multi_output_groups(plan: list[dict]) -> list[dict]:
             for i, results in enumerate(entry["member_results"])
             if any(_escapes(v, produced) for v in results)
         ]
-        # Keep the group whole while only its last member escapes, which is the normal case.
+        # Only the last member escapes: the normal case.
         if len(escaping) < 2:
             out.append(entry)
             continue
@@ -1082,8 +829,7 @@ def _split_multi_output_groups(plan: list[dict]) -> list[dict]:
         entry["handles"] = entry["handles"][:cut]
         entry["member_results"] = entry["member_results"][:cut]
         entry["shape"] = _shape_of(entry["member_results"][-1])
-        # The tail is elementwise by construction: only elementwise ops are ever absorbed
-        # into a group, so everything after the cut is one.
+        # The tail is elementwise by construction: only elementwise ops are ever absorbed.
         tail.update(
             op="linalg.generic",
             kind="elementwise",
@@ -1106,11 +852,10 @@ def _shape_of(results):
 
 
 def _is_minor_transpose(permutation) -> bool:
-    """True for a permutation that swaps ONLY the last two dims, i.e. the K^T shape.
+    """True for a permutation that swaps only the last two dims (`[0, 2, 1]`), i.e. a K^T.
 
-    `[0, 2, 1]` yes; `[1, 0, 2]` (the head-major transpose) no. The distinction matters
-    because the fused-attention rewrite subsumes a K^T but requires its Q/K/V operands to be
-    batch-major, so a transpose that moves the BATCH dim must keep its own kernel.
+    The fused-attention rewrite subsumes a K^T but needs batch-major Q/K/V, so the head-major
+    `[1, 0, 2]` transpose must keep its own kernel.
     """
     if not permutation:
         return False
@@ -1154,8 +899,7 @@ def params_for_plan(
         elif entry["kind"] == "reduction":
             out.append(dict(RED_PARAMS))
         elif entry["kind"] == "attention":
-            # d_head comes from the region's own output width, so a payload with a
-            # different head dim is at least reported rather than silently mis-tiled.
+            # d_head comes from the region's own output width.
             p = dict(FA_PARAMS)
             if entry["shape"]:
                 p["n_head"] = entry["shape"][-1]
@@ -1164,25 +908,17 @@ def params_for_plan(
             p = dict(ew_params)
             shape = entry["shape"]
             if shape and len(shape) >= 2:
-                # Which extent sizes the row tile depends on how the kind is tiled, so the two
-                # must stay in step -- a disagreement shows up as "'xegpu.load_nd' op
-                # TensorDesc shape is not distributable with the layout". Elementwise
-                # (`_ew_tile_sizes`) blocks the largest non-innermost dim (`_block_axis`); a
-                # transpose (`_transpose_tile_sizes`) always blocks the LAST non-innermost one
-                # (`_transpose_block_axis`, and that is a correctness requirement -- see there).
-                # Rank 2 blocks the rows in both cases.
+                # The row extent must be the dim the tiling will block (`_ew_tile_sizes` vs
+                # `_transpose_tile_sizes`); a mismatch makes the layout non-distributable.
                 if len(shape) <= 2:
                     rows = shape[-2]
                 elif entry["kind"] == "transpose":
                     rows = shape[_transpose_block_axis(shape)]
                 else:
                     rows = shape[_block_axis(shape)]
-                # Shrink the SUBGROUP tile before clamping the work-group tile. The blocked
-                # extent can be smaller than one subgroup -- the attention output transpose
-                # blocks H = 4 against `sg_m` = 32 -- and `_floor_to` floors to at least one
-                # subgroup, so clamping alone would claim a 32-row tile of a 4-row dim. All of
-                # these are powers of two in practice, so `min` keeps the divisibility the
-                # annotation asserts (wg % sg == 0, sg % load == 0).
+                # Shrink the subgroup tile before clamping the work-group tile: the blocked
+                # extent can be smaller than one subgroup (H = 4 against sg_m = 32). Extents
+                # are powers of two, so `min` keeps the divisibility the annotation asserts.
                 p["sg_m"] = min(p["sg_m"], rows)
                 p["load_m"] = min(p["load_m"], p["sg_m"])
                 p["sg_n"] = min(p["sg_n"], shape[-1])
@@ -1194,58 +930,35 @@ def params_for_plan(
 
 
 def _block_axis(shape) -> int:
-    """Which dim a rank > 2 kernel blocks: the LARGEST non-innermost extent.
+    """Dim a rank > 2 kernel blocks: the largest non-innermost extent.
 
-    The innermost dim is always left whole -- it is the contiguous one, and keeping it whole
-    is what makes the store a block store. Among the rest, blocking the largest extent is the
-    only choice that is safe in general. Blocking a fixed position instead breaks on real
-    payloads: GQA's broadcast is `(kv, rep, hs, T)` with LEADING extents of 2, so blocking
-    dim 0 asks for a 32-wide tile of a 2-wide dim (`_floor_to` floors to at least one
-    subgroup, which cannot go below `sg_m`), and the tiled op then dies with "Attempted to
-    vectorize, but failed". The output transpose `(T, H, hs)` has the same problem one dim
-    over, with H = 4.
+    The innermost dim stays whole so the store is a block store. Blocking a fixed position
+    breaks on real payloads: the GQA broadcast `(kv, rep, hs, T)` has leading extents of 2,
+    and a subgroup-wide tile of a 2-wide dim fails to vectorize.
     """
     lead = list(shape[:-1])
     return max(range(len(lead)), key=lambda i: lead[i])
 
 
 def _transpose_block_axis(shape) -> int:
-    """Which dim a rank > 2 TRANSPOSE blocks: always the last non-innermost one.
+    """Dim a rank > 2 transpose blocks: always the last non-innermost one.
 
-    Not `_block_axis` (largest extent), and the difference is a correctness bug rather than a
-    tuning choice. Peeling every dim before the blocked one to 1 puts the resulting unit dims
-    LEADING in the output slice, and only a leading unit dim survives the rank reduction:
-
-      * blocked dim last  -> output slice `(1, ..., 1, tile, innermost)`. Vectorizing the
-        `tensor.insert_slice` of the folded 2-D value into that slice gives a minor-identity
-        `transfer_write` whose dims line up, `in_bounds = [true, true]`. Correct.
-      * blocked dim earlier -> a unit dim in the MIDDLE, e.g. `(tile, 1, innermost)` for the
-        attention output transpose `(H,T,hs) -> (T,H,hs)` when T is blocked. Upstream
-        `vectorizeAsInsertSliceOp` then emits `vector.transfer_write vector<128x64xf16>` into
-        `tensor<128x1x64xf16>` under a MINOR-IDENTITY map with `in_bounds = [false, true]` --
-        it computes the vector SHAPE correctly for a non-trailing dropped dim but not the
-        permutation map -- so the 128 lands on the size-1 dim and the write is CLIPPED TO ONE
-        ROW. That lowered to `create_nd_tdesc` on a `memref<1x64xf16>` producing a
-        `tensor_desc<128x64xf16>`, and it silently threw away the whole attention result: the
-        full block "passed" at rel 0.0052 while `attn @ wo` was bitwise zero.
-
-    The read side is free to have its unit dim in the middle: the folding leaves an explicit
-    2-D `tensor.extract_slice`, which `_bufferize_keeping_transpose_subviews` keeps as a
-    rank-reduced strided `memref.subview` that `xegpu.create_nd_tdesc` takes directly.
-
-    For the Q/K/V head-major transposes `(T,H,hs) -> (H,T,hs)` this picks the same dim
-    `_block_axis` already picked, so it changes nothing there.
+    Peeling the dims before the blocked one to 1 must leave the unit dims LEADING in the
+    output slice. A unit dim in the middle, `(tile, 1, innermost)`, makes the upstream
+    insert_slice vectorization emit a `transfer_write` with the wrong permutation map for
+    the dropped dim, so the write is clipped to one row; that silently zeroed the whole
+    attention result once. The read side may keep a middle unit dim: it stays a
+    rank-reduced `memref.subview` that `xegpu.create_nd_tdesc` takes directly.
     """
     return len(shape) - 2
 
 
 def _rank_n_tile_sizes(shape, params, axis=None) -> list[int]:
-    """Peel every non-innermost dim by 1 except the blocked one; leave the innermost whole.
+    """Peel every non-innermost dim to 1 except the blocked one; keep the innermost whole.
 
-    The unit dims are load-bearing: they let the post-tiling unit-extent folding collapse the
-    op to 2-D, which is the only shape the XeGPU work-group layouts can distribute over (a
-    rank-3 `tensor_desc` is rejected outright). Keeping the innermost dim whole is what keeps
-    the store contiguous.
+    The unit dims let the post-tiling unit-extent folding collapse the op to 2-D, the only
+    rank the XeGPU work-group layouts distribute. The whole innermost dim keeps the store
+    contiguous.
     """
     if axis is None:
         axis = _block_axis(shape)
@@ -1253,11 +966,7 @@ def _rank_n_tile_sizes(shape, params, axis=None) -> list[int]:
 
 
 def _ew_tile_sizes(shape, params) -> list[int]:
-    """Work-group tile sizes for an elementwise op of any rank.
-
-    Rank 2 tiles both dims; higher ranks go through `_rank_n_tile_sizes`. The hand schedule
-    does the same thing for RoPE with `tile_sizes=[1, wg_rows, 0]`.
-    """
+    """Work-group tile sizes for an elementwise op of any rank."""
     rank = len(shape) if shape else 2
     if rank <= 2:
         return [params["wg_m"], params["wg_n"]]
@@ -1267,12 +976,8 @@ def _ew_tile_sizes(shape, params) -> list[int]:
 def _transpose_tile_sizes(shape, params) -> list[int]:
     """Work-group tile sizes for a `linalg.transpose`.
 
-    Differs from elementwise only at rank 2, where the innermost dim is left WHOLE rather
-    than tiled by `wg_n`. A transpose's iteration space is its OUTPUT (`linalg.transpose`
-    takes its rank from `getInit()`, giving the output the identity map and the input the
-    inverse permutation), and what has to stay contiguous is the output STORE -- so block
-    rows and keep the full row. The read is then the strided side, which is the correct way
-    round: a column-strided STORE is what silently corrupts a transpose.
+    At rank 2 the innermost dim stays whole: the iteration space is the OUTPUT, and the
+    output store must stay contiguous (a column-strided store silently corrupts a transpose).
     """
     rank = len(shape) if shape else 2
     if rank <= 2:
@@ -1281,11 +986,11 @@ def _transpose_tile_sizes(shape, params) -> list[int]:
 
 
 def _tile_one_reduction(anytype, output, wg_rows, rss):
-    """Tile a reduction group into one kernel (mirrors `_tile_one_rmsnorm`).
+    """Tile a reduction group into one kernel (mirrors the hand `_tile_one_rmsnorm`).
 
     `output` is the group's final elementwise generic; fusing its producers pulls the
-    reduction in. Mandatory for a reduction: the reduced intermediate cannot be a kernel
-    output, since a reduced/1-wide `xegpu.tensor_desc` is invalid.
+    reduction in. Mandatory: a reduced, 1-wide `xegpu.tensor_desc` is invalid, so the
+    reduced intermediate cannot be a kernel output.
     """
     _, [forall], _ = lh_transform.tile(
         output,
@@ -1319,14 +1024,10 @@ def _tile_one_reduction(anytype, output, wg_rows, rss):
             anytype, anytype, producer_op=producers, containing_op=loop
         )
 
-    # `stop_at_reductions=True` is load-bearing once the group owns the HEAD of its chain
-    # (`x*x`, and `x.float()` for the f32 norm). Tracing from the group's OUTPUT walks back
-    # through the reduction and, unbounded, picks up `x*x` -- whose only consumer is the
-    # reduction, not this loop -- so `fuse_into_containing_op` fails with "could not find next
-    # producer to fuse into container". (That is the failure recorded in `classify_payload` as
-    # the reason absorbing the head "breaks tiling": it is about the PRODUCER SET, not about
-    # fusion being impossible.) With the reduction as a barrier the set is exactly the normalize
-    # chain plus `x.float()`, which the normalize reads DIRECTLY and so is still reachable.
+    # `stop_at_reductions=True`: tracing from the output would walk through the reduction
+    # and pick up `x*x`, whose only consumer is the reduction, and
+    # `fuse_into_containing_op` fails on a producer with no use in the loop. With the
+    # barrier the set is the normalize chain plus `x.float()`, which the normalize reads.
     tiled_out, out_loop = structured.TileUsingForOp(out_op, sizes=[0, rss]).results
     fuse_elementwise_producers(tiled_out, out_loop, stop_at_reductions=True)
     transform.apply_dce(forall)
@@ -1344,35 +1045,20 @@ def _tile_one_reduction(anytype, output, wg_rows, rss):
 def _tile_one_attention(anytype, pv_op, shape, params, absorbed_transpose=False):
     """Tile one attention region into a forall and rewrite it as a flash loop.
 
-    Structure follows the hand `llama3_schedule.py:_fuse_attention_in_region`: tile the P@V
-    contraction, pull the rest of the region in, then hand
-    `transform_ext.replace_with_fused_attention` five explicit handles. It replaces the P@V
-    contraction with an online-softmax loop, after which the materialized scores, the
-    softmax chain and the K^T transpose are all dead and get DCE'd.
+    Follows the hand schedule's `_fuse_attention_in_region`: tile the P@V contraction, pull
+    the region in, then hand `replace_with_fused_attention` the Q/K/V, scale and output
+    handles. It replaces the P@V contraction with an online-softmax loop; the materialized
+    scores, the softmax chain and the K^T transpose are dead afterwards and get DCE'd.
 
-    Two deliberate differences from the hand version:
-
-    * Producers are pulled in with `fuse_producers=True` rather than by hand-walking the
-      SSA chain op by op. The hand walk (`div -> den -> num -> mx -> scaled -> qkt` plus
-      four fills) is written against the hand payload's exact op sequence; torch-mlir's is
-      longer and differently shaped -- an extra `truncf` after the f32-accumulating
-      batch_matmul, a separate subtract, a `tensor.expand_shape` before it, and a
-      TWO-result max (torch's max carries an i64 argmax) -- so hand hops would be brittle.
-      Topological tiling order makes this safe: every earlier kernel is already inside its
-      own forall and cannot be re-absorbed.
-
-    * The SCALE is found the library schedule's way, not the hand way. The hand code matches
-      a `linalg.mul`/`linalg.elementwise` and walks operand 1 -> `linalg.fill` ->
-      `arith.constant`, which is the hand payload's scale-broadcast-into-a-tensor shape.
-      torch-mlir captures the scale as a SCALAR constant inside a generic
-      (`arith.mulf %in, %cst`), with no fill and no named mul op, so we go
-      max reduction -> its first generic ancestor -> `arith.mulf` -> `arith.constant`.
-
-    The max reduction is only a landmark for that search; nothing else needs it.
+    Producers are pulled in with `fuse_producers=True` instead of walking the op chain by
+    hand: torch-mlir's sequence is longer than the hand payload's (an extra `truncf`, a
+    separate subtract, an `expand_shape`, a two-result max) and would make hops brittle.
+    Topological tiling order makes this safe, since every earlier kernel is already in its
+    own forall.
     """
     rank = len(shape) if shape else 3
-    # Peel the batch dims by 1 and block the query rows, leaving head_dim whole: the inner
-    # op is then plain single-head attention, which is the shape the flash rewrite expects.
+    # Peel the batch dims to 1 and block the query rows, leaving head_dim whole: the inner
+    # op is then single-head attention, the shape the flash rewrite expects.
     tile_sizes = [1] * (rank - 2) + [params["wg_rows"], 0]
     _, [forall], _ = lh_transform.tile(
         pv_op,
@@ -1397,58 +1083,25 @@ def _tile_one_attention(anytype, pv_op, shape, params, absorbed_transpose=False)
             transform_ext.trace_producers(target), op_names=op_names
         )
 
-    # Q/K/V are taken from the contractions' OPERANDS, not by picking the Nth
-    # `tensor.extract_slice` producer as both reference schedules do. Positional selection
-    # over traced producers only holds when Q/K/V are function arguments: in a whole block
-    # they are other kernels' outputs, more slices appear in the trace, and the handles slide
-    # -- the flash rewrite then gets the wrong `k`, its K^T transpose stays LIVE, and the
-    # kernel ends up with an extra full-width `tensor_desc<64x256xf16>` load. That shifts the
-    # annotation's positional load assignment (it expects Q, K, V) and fails as
-    # "'xegpu.load_nd' op TensorDesc shape is not distributable with the layout".
-    #
-    # Passing the SLICES (rather than the underlying buffers) is deliberate: it is how the
+    # Q/K/V come from the contractions' operands, not from positional `extract_slice`
+    # producers: in a whole block Q/K/V are other kernels' outputs, more slices appear in
+    # the trace, and positions slide. Passing the slices rather than the buffers is how the
     # flash op recovers the query-row offset that causal masking needs.
     q = transform.get_producer_of_operand(anytype, qk_matmul, operand_number=0)
     k = transform.get_producer_of_operand(anytype, qk_matmul, operand_number=1)
     if absorbed_transpose:
-        # K^T was absorbed into this region, so QK^T's rhs is the transpose. The flash op
-        # wants K itself -- `[*batch, n_ctx, d_head]`, which it transposes internally -- so
-        # hop over it. The transpose is then dead and is DCE'd, which is exactly what makes
-        # the kernel come out with 3 loads instead of 4.
+        # QK^T's rhs is the absorbed K^T. The flash op wants K itself (`[*batch, n_ctx,
+        # d_head]`, transposed internally), so hop over it; the transpose is then dead.
         k = transform.get_producer_of_operand(anytype, k, operand_number=0)
     # P@V: operand 0 is the softmax output, operand 1 is V.
     v = transform.get_producer_of_operand(anytype, pv_matmul, operand_number=1)
 
-    # The scale: torch-mlir emits it as a generic holding `arith.mulf %in, %cst`, so match
-    # the mulf INSIDE the forall and trace to its constant. This is region-scoped, which is
-    # better than either reference: the hand schedule matches a `linalg.mul`/
-    # `linalg.elementwise` and walks operand 1 -> `linalg.fill` -> constant (the hand
-    # payload's scale-broadcast-into-a-tensor, which torch-mlir never produces), and the
-    # library schedule uses the max reduction as a landmark and searches the whole FUNCTION
-    # for `arith.max*` -- which would not even work here, because the softmax reductions do
-    # NOT end up inside the forall (the `tensor.expand_shape` that restores the reduced rank
-    # blocks the fusion), and searching the function breaks as soon as there are two
-    # attention regions. Nothing else needs the reductions: once the P@V contraction is
-    # replaced by the flash loop the whole softmax chain is dead and is DCE'd where it lies.
-    # Take the FIRST `arith.mulf`, not the only one: there are several. The scale multiply
-    # feeds both the max reduction and the subtract, and tile-and-fuse clones a producer per
-    # consumer, so the region ends up with three copies of it. They are clones reading the
-    # same constant, so any of them traces to the right `arith.constant`, and all of them
-    # die with the rest of the chain when the flash loop replaces the contraction.
-    #
-    # The library schedule avoids the duplication by running `linalg-fuse-elementwise-ops`
-    # over the function before tiling, which collapses the chain first. We deliberately do
-    # NOT: that pass rewrites every other contraction into a generic too, and on a payload
-    # with projections it takes `linalg.matmul` to 0 and kills the DPAS path (measured -- see
-    # `_gqa_probe.py`). Tolerating the clones is the cheaper trade.
-    # Matching `arith.mulf` across the region is NOT enough to find the scale: a
-    # `linalg.batch_matmul` over f16 operands with an f32 accumulator carries an IMPLICIT
-    # body of `arith.extf` + `arith.mulf` + `arith.addf`, which the printer does not show for
-    # a named op. So the FIRST `arith.mulf` in the region is the QK^T contraction's own
-    # multiply -- an f32 one whose operand is an `arith.extf` -- and using it fails with
-    # "Expected scale to be arith.constant, got arith.extf". Select by ENCLOSING OP rather
-    # than by position: keep only the multiplies whose immediate parent is a
-    # `linalg.generic`, which is the form torch-mlir emits the scale in.
+    # torch-mlir emits the scale as `arith.mulf %in, %cst` inside a generic. Match the
+    # mulfs inside the forall and keep only those whose parent is a `linalg.generic`: a
+    # named `batch_matmul` over f16 with an f32 accumulator has an implicit
+    # `extf + mulf + addf` body whose mulf would otherwise be matched first. Several clones
+    # of the scale multiply exist (tile-and-fuse clones a producer per consumer); any of
+    # them traces to the same constant and all die with the softmax chain.
     mulfs = match(forall, ops={"arith.mulf"})
     scale_generic = transform_ext.extract_handle(
         transform_ext.filter_by_name(
@@ -1460,10 +1113,8 @@ def _tile_one_attention(anytype, pv_op, shape, params, absorbed_transpose=False)
     scale_mul = transform_ext.extract_handle(
         match(scale_generic, ops={"arith.mulf"}), 0
     )
-    # Operand 1 of `arith.mulf %in, %cst` IS the scale constant, so ask what defines it
-    # rather than tracing producers: the constant sits at FUNCTION scope, outside the
-    # forall, and `trace_producers` does not walk out of the region (it returns an empty
-    # handle and `extract_handle` then fails with "Invalid index 0 for target of length 0").
+    # The constant sits at function scope, outside the forall, where `trace_producers`
+    # does not walk; ask what defines operand 1 instead.
     scale = transform.get_producer_of_operand(anytype, scale_mul, operand_number=1)
 
     transform_ext.replace_with_fused_attention(
@@ -1483,63 +1134,34 @@ def _tile_one_attention(anytype, pv_op, shape, params, absorbed_transpose=False)
 def _vectorize_kernels_only(func):
     """Vectorize the linalg ops INSIDE the foralls, and nothing else.
 
-    The reusable `vectorize()` hands the whole function to
-    `transform.structured.vectorize_children_and_apply_patterns`, and that is wrong here.
-    Every op that becomes a kernel is inside an `scf.forall` by construction, so whatever
-    is left outside one is HOST code -- and `tensor.insert_slice` is vectorizable
-    (`linalg::hasVectorizationImpl`). A payload that writes its result in slices (RoPE's
-    two rotated halves) therefore gets its two host-level inserts turned into a
-    `vector<1024x32xf16>` transfer pair in the host function, reading and writing device
-    memory, which faults. Left unvectorized they reach bufferization, which sees that each
-    forall already wrote that exact subset of the output -- empty-tensor elimination made
-    the forall's init that subset -- and elides them entirely.
+    Everything outside a forall is host code, and `tensor.insert_slice` is vectorizable: a
+    payload that writes its result in slices would get a `vector<1024x32xf16>` transfer pair
+    in the host function over device memory, which faults. Left alone, bufferization elides
+    those inserts because the foralls already wrote the exact subsets.
 
-    `vectorize_children_and_apply_patterns` cannot simply be pointed at the foralls: it
-    requires an isolated-from-above target. So the per-op form is used and the patterns it
-    would have run afterwards are applied here instead. They are not optional --
-    `reduction_to_contract` and `fold_arith_extension` are what turn a vectorized matmul
-    into a `vector.contract` over f16 operands with an f32 accumulator, which is the one
-    shape `convert-vector-to-xegpu` will emit an `xegpu.dpas` for.
+    `vectorize_children_and_apply_patterns` needs an isolated-from-above target, so the
+    per-op form is used and its follow-up patterns are applied here. `reduction_to_contract`
+    and `fold_arith_extension` are what make a matmul a `vector.contract` over f16 with an
+    f32 accumulator, the one shape `convert-vector-to-xegpu` turns into `xegpu.dpas`.
     """
-    # Matched by INTERFACE, not by op name: reduction tiling introduces linalg ops the
-    # plan never names (`tile_reduction_using_for` adds a partial-accumulator op and a
-    # merge), and leaving one unvectorized crashes the XeGPU lowering later. Per forall,
-    # because a `structured.match` takes a single target op.
+    # Match by interface, not op name: reduction tiling adds linalg ops the plan never names,
+    # and one left unvectorized crashes the XeGPU lowering. Per forall, because
+    # `structured.match` takes a single target.
     #
-    # `tensor.insert_slice` is vectorized too, but ONLY here, inside a forall. That is the
-    # whole distinction this function draws: inside a forall is kernel code, where an insert
-    # must become vector transfers; outside is host code, where vectorizing one produces a
-    # giant host-side transfer over device memory. A transpose needs this -- the unit-extent
-    # folding reduces a tiled `linalg.transpose` to two rank-2 strided subviews with only a
-    # subset copy between them, no linalg op left, and unvectorized that bufferizes to a
-    # `memref.copy` in the KERNEL, which lowers to a `memrefCopy` runtime call that is not
-    # linked into the device binary ("'llvm.call' op 'memrefCopy' does not reference a
-    # symbol in the current scope").
+    # Inside a forall an `insert_slice` is kernel code and must become vector transfers: a
+    # tiled transpose folds to two strided subviews with a subset copy between them, which
+    # unvectorized becomes a `memref.copy` in the kernel and an unlinked `memrefCopy` call.
     with lh_transform.foreach(match(func, ops={"scf.forall"})) as loop:
         structured.structured_vectorize(
             match(loop, interface=structured.MatchInterfaceEnum.LinalgOp), []
         )
         structured.structured_vectorize(match(loop, ops={"tensor.insert_slice"}), [])
-        # The follow-up patterns are applied PER FORALL, for the same reason vectorization
-        # is: a forall is one kernel, and these patterns reach across kernel boundaries and
-        # into the host code between them when applied func-wide. Scoping them keeps each
-        # rewrite inside the one kernel it is allowed to reason about. (Unlike a registered
-        # PASS, `apply_patterns` has no isolated-from-above requirement, so it CAN be scoped
-        # to a forall.)
-        #
-        # NOTE what is deliberately NOT here: `fold_tensor_subset_ops_into_vector_transfers`.
-        # Folding an `extract_slice` into a `transfer_read` is fine only while the slice is
-        # minor-identity. A head-major transpose's INPUT slice is not: tiling
-        # `(T,H,hs) -> (H,T,hs)` blocks the query rows and peels the head, so the input slice
-        # is `(rows, 1, hs)` -- a unit dim in the MIDDLE. Folded, that becomes a read of the
-        # whole tensor under `permutation_map = (d0,d1,d2) -> (d0,d2)`, which
-        # `convert-vector-to-xegpu` does not convert; the store next to it does convert, and
-        # the kernel then fails work-group distribution with "'xegpu.store_nd' op Value shape
-        # [128, 64] is not consistent with tensor descriptor ...<32x32xf16>". Left unfolded,
-        # the slice bufferizes to a rank-reduced `memref.subview` -- a strided 2-D memref,
-        # which `xegpu.create_nd_tdesc` takes directly. See `_bufferize_keeping_subviews`,
-        # which is the other half of this: the library `bufferize` re-does the same fold at
-        # the memref level.
+        # Patterns are scoped per forall: func-wide they reach across kernel boundaries into
+        # the host code. `fold_tensor_subset_ops_into_vector_transfers` is deliberately
+        # absent: a head-major transpose's input slice `(rows, 1, hs)` folded into a
+        # `transfer_read` gets a permutation map `convert-vector-to-xegpu` cannot convert,
+        # while unfolded it bufferizes to a strided subview that `create_nd_tdesc` takes
+        # directly. `_bufferize_keeping_transpose_subviews` is the memref-level half of this.
         with ir.InsertionPoint(transform.apply_patterns(loop).patterns):
             vector_transform.apply_patterns_vector_transfer_permutation_patterns()
             vector_transform.apply_patterns_vector_reduction_to_contract()
@@ -1558,28 +1180,15 @@ def _vectorize_kernels_only(func):
 
 
 def _bufferize_keeping_transpose_subviews(mod, payload_func_name, plan):
-    """One-shot bufferization; fold memref aliases into transfers EXCEPT in transposes.
+    """One-shot bufferization; fold memref aliases into transfers except in transposes.
 
-    Same as `lowering_common.bufferize`, except its `fold_memref_alias_ops` step is applied
-    per kernel and skipped for the transpose ones. Both halves of that are load-bearing.
-
-    Why it must be skipped for a transpose: the step folds a `memref.subview` into the
-    `vector.transfer_read` that reads it, and for a RANK-REDUCING subview that means
-    re-expressing the drop as a projected `permutation_map`. A head-major transpose's input
-    slice drops a MIDDLE dim -- tiling `(T,H,hs) -> (H,T,hs)` blocks the query rows and peels
-    the head, giving an input slice of `(rows, 1, hs)` -- so folding yields a read of the
-    whole tensor under `(d0,d1,d2) -> (d0,d2)`, which `convert-vector-to-xegpu` does not
-    convert. The store beside it DOES convert, so the kernel ends up with a work-group-shaped
-    `vector.transfer_read` feeding an already-distributed `xegpu.store_nd` and fails as
-    "'xegpu.store_nd' op Value shape [128, 64] is not consistent with tensor descriptor
-    ...<32x32xf16>". Left unfolded the slice stays a rank-reduced `memref.subview` -- a
-    strided 2-D memref, which `xegpu.create_nd_tdesc` takes directly.
-
-    Why it must be KEPT for the others: in a k-loop the subview's offset is the loop
-    induction variable, and the `create_nd_tdesc` built from it gets hoisted by LICM, leaving
-    "operand #0 does not dominate this use". Folding puts the varying part in the transfer's
-    INDICES, so the descriptor is built once from the loop-invariant base. A transpose has no
-    k-loop, which is why skipping it there costs nothing.
+    Like `lowering_common.bufferize`, but `fold_memref_alias_ops` runs per kernel and skips
+    the transpose ones. Folding a rank-reducing subview that drops a MIDDLE dim (a head-major
+    transpose's `(rows, 1, hs)` input slice) yields a `transfer_read` with a projected
+    permutation map that `convert-vector-to-xegpu` rejects; left unfolded it is a strided
+    2-D subview that `create_nd_tdesc` takes directly. The fold is kept everywhere else: a
+    k-loop's subview offset is the induction variable, and an unfolded `create_nd_tdesc`
+    gets hoisted by LICM past its definition.
     """
     bufferization_transform.bufferization_eliminate_empty_tensors(mod)
     mod = bufferization_transform.bufferization_one_shot_bufferize(
@@ -1604,12 +1213,12 @@ _ALIAS_OPS = ("memref.subview", "memref.expand_shape", "memref.collapse_shape")
 
 
 def _memref_chain(value):
-    """Every memref value from `value` back to its underlying buffer, closest first.
+    """Every memref value from `value` back to its buffer, closest first, through subview /
+    expand_shape / collapse_shape.
 
-    Walks `subview` / `expand_shape` / `collapse_shape`. The whole chain is returned, not just
-    the base, because the interesting value is usually in the MIDDLE: a tiled transpose reads
-    `subview(subview(expand_shape(buffer)))`, and the op that the permutation describes is the
-    `expand_shape` -- the buffer viewed at the transpose's own rank, not the flat buffer.
+    The whole chain is returned because the interesting value is usually in the middle: a
+    tiled transpose reads `subview(subview(expand_shape(buffer)))`, and the value its
+    permutation describes is the `expand_shape`, not the flat buffer.
     """
     chain = [value]
     while True:
@@ -1671,27 +1280,23 @@ def _top_level_index(use_owner, ops):
 
 
 def _redirect_transpose_writer(block, forall, perm, src, dst):
-    """Remove a transpose copy kernel by making its source's PRODUCER write the destination.
+    """Remove a transpose copy kernel by making the SOURCE's producer write the destination.
 
-    This is the attention OUTPUT transpose: attention writes `(H, T, hs)`, the transpose
-    kernel copies it to `(T, H, hs)`, and a `memref.collapse_shape` then reads that as `(T, C)`
-    for the output projection. The destination cannot become a view (a permuted view is never
-    contiguous, and collapsing needs contiguity), but the SOURCE can: build a permuted view of
-    the destination that has the source's shape, and retarget the producer kernel's stores at
-    it. The producer then writes `dst[t, h, :]` directly -- exactly how the hand payload's
-    attention kernel stores through a strided `(H, T, hs)` view of the `(T, C)` buffer -- and
-    the copy kernel, its buffer and its dealloc are dead.
+    This is the attention output transpose: attention writes `(H, T, hs)`, the copy kernel
+    makes it `(T, H, hs)`, and a `memref.collapse_shape` reads that as `(T, C)`. The
+    destination cannot become a permuted view (collapsing needs contiguity), so instead the
+    producer's stores are retargeted at a permuted view of the destination that has the
+    source's shape, and the copy kernel, its buffer and its dealloc die. This is how the hand
+    payload's attention kernel stores through a strided view of the `(T, C)` buffer.
 
-    Conditions, all checked, any failure leaves the kernel in place:
+    Conditions, any failure leaves the kernel in place:
       * `src` and `dst` are plain `memref.alloc`s; `src` is written by exactly one preceding
-        top-level forall (the producer) and read by nothing but this kernel until it is next
-        written (bufferization reuses allocs across layers);
-      * `dst` is not touched between the producer and this kernel, since the redirected store
-        lands at the producer's position;
-      * every access to `src` inside the producer is a `vector.transfer_write` directly on the
-        buffer (no subview in between), so the operand can be swapped for the view unchanged:
-        the view is built so that `view[i0, i1, i2] == dst[permuted]`, i.e. the producer's
-        indices stay exactly as they are.
+        top-level forall and read only by this kernel until it is next written
+        (bufferization reuses allocs across layers);
+      * `dst` is not touched between the producer and this kernel;
+      * every access to `src` inside the producer is a `vector.transfer_write` directly on
+        the buffer, so swapping the operand for the view keeps the indices unchanged
+        (`view[i0, i1, i2] == dst[permuted]`).
     Returns True if the kernel was removed.
     """
     ops = list(block.operations)
@@ -1724,7 +1329,7 @@ def _redirect_transpose_writer(block, forall, perm, src, dst):
         if at in (writer, here):
             continue
         if writer < at < next_writer:
-            return False  # someone else reads (or writes) src while it is live
+            return False  # src is read or written while live
     for use in dst.uses:
         owner = use.owner
         if owner.operation.name == "memref.dealloc":
@@ -1733,7 +1338,7 @@ def _redirect_transpose_writer(block, forall, perm, src, dst):
         if at is None:
             return False
         if writer <= at < here:
-            return False  # dst holds live data while the producer would already write it
+            return False  # dst holds live data the producer would overwrite
     stores = []
 
     def collect(o):
@@ -1758,13 +1363,12 @@ def _redirect_transpose_writer(block, forall, perm, src, dst):
     rank = len(perm)
     if src_type.rank != rank or dst_type.rank != rank:
         return False
-    # dst.shape[i] == src.shape[perm[i]]; the view has src's shape, so it takes dst's dim
-    # inv[i] at position i.
+    # dst.shape[i] == src.shape[perm[i]]; the view has src's shape, so position i takes
+    # dst's dim inv[i].
     inv = [perm.index(i) for i in range(rank)]
     dst_strides = _row_major_strides(list(dst_type.shape))
-    # The destination buffer is usually allocated after the producer; hoist its alloc above
-    # it. Only when it actually sits below: bufferization reuses one alloc across layers, and
-    # moving an alloc that is already above would drag it past its earlier uses.
+    # Hoist the destination alloc above the producer only when it sits below it: an alloc
+    # reused across layers may already be above, with earlier uses.
     dst_at = _top_level_index(dst.owner, ops)
     if dst_at is not None and dst_at > writer:
         dst.owner.operation.move_before(producer.operation)
@@ -1774,7 +1378,9 @@ def _redirect_transpose_writer(block, forall, perm, src, dst):
         view_type = ir.MemRefType.get(
             [dst_type.shape[inv[i]] for i in range(rank)],
             dst_type.element_type,
-            layout=ir.StridedLayoutAttr.get(0, [dst_strides[inv[i]] for i in range(rank)]),
+            layout=ir.StridedLayoutAttr.get(
+                0, [dst_strides[inv[i]] for i in range(rank)]
+            ),
         )
         view = memref.transpose(view_type, dst, pmap)
     for store in stores:
@@ -1788,26 +1394,17 @@ def _redirect_transpose_writer(block, forall, perm, src, dst):
 
 
 def replace_transpose_kernels_with_views(mod, payload_func_name, plan, kernel_params):
-    """Delete every transpose KERNEL and present its result as a strided `memref` view.
+    """Delete every transpose kernel and present its result as a strided `memref` view.
 
-    This is how BOTH reference implementations avoid these kernels, and neither does it by
-    fusing: the permutation is carried in the STRIDES, not by moving data.
-      * the hand payload (`llama3_payload.py:_heads_view_of`) builds
-        `memref.expand_shape` + `memref.transpose` -- pure layout, no kernel -- and tiling then
-        peels head h into a 2-D `memref<T x hs, strided<[C,1], offset: h*hs>>` that
-        `xegpu.create_nd_tdesc` block-loads directly.
-      * Inductor's captured graph passes `f16[1,32,256,64][524288,64,2048,1]` straight into the
-        SDPA call: `aten.permute` is metadata, and head stride 64 / token stride 2048 is the
-        same strided view.
-    A torch-mlir payload cannot express it, because linalg-on-tensors has no view concept for a
-    permutation of a VALUE -- `linalg.transpose` is a copy. But after bufferization the buffers
-    exist, so the copy can be replaced by a view of the producer's buffer, which is what this
-    does. It runs in Python between two halves of the schedule
-    (`generic_schedule(..., stop_after_bufferize=True)` then `generic_schedule_tail`) because
-    the transform dialect has no op for "replace this copy with a view".
+    Both references avoid these kernels by carrying the permutation in STRIDES: the hand
+    payload builds `memref.expand_shape` + `memref.transpose`, and Inductor passes a permuted
+    strided tensor straight into SDPA. Linalg-on-tensors cannot express that
+    (`linalg.transpose` is a copy), but after bufferization the buffers exist and the copy
+    can be replaced by a view of the producer's buffer. Runs in Python between
+    `generic_schedule(..., stop_after_bufferize=True)` and `generic_schedule_tail`, since the
+    transform dialect has no op for it.
 
-    Returns the plan and params with the transpose entries dropped, for the tail -- which
-    matches one `gpu.module` per remaining entry.
+    Returns the plan and params with the replaced entries dropped, for the tail.
     """
     func = get_payload_func_op(mod, payload_func_name)
     block = func.regions[0].blocks[0]
@@ -1828,12 +1425,12 @@ def replace_transpose_kernels_with_views(mod, payload_func_name, plan, kernel_pa
             elif inner.operation.name == "vector.transfer_write":
                 writes.append(inner)
         if len(reads) != 1 or len(writes) != 1:
-            continue  # not a plain copy kernel; leave it alone
+            continue  # not a plain copy kernel
         dst = _memref_chain(writes[0].operands[1])[-1]
         dst_type = ir.MemRefType(dst.type)
-        # Pick the source value the permutation actually describes: same rank, and permuting
-        # its shape gives the destination's. Searched from the BUFFER end outwards, so the
-        # whole-buffer `expand_shape` wins over the per-tile `subview`s above it.
+        # The source the permutation describes: same rank, and permuting its shape gives the
+        # destination's. Searched from the buffer end so the whole-buffer `expand_shape`
+        # wins over the per-tile subviews above it.
         src = None
         for cand in reversed(_memref_chain(reads[0].operands[0])):
             cand_type = ir.MemRefType(cand.type)
@@ -1843,25 +1440,17 @@ def replace_transpose_kernels_with_views(mod, payload_func_name, plan, kernel_pa
                 src = cand
                 break
         if src is None:
-            continue  # nothing in the chain matches the permutation; be conservative
+            continue  # nothing in the chain matches the permutation
         src_type = ir.MemRefType(src.type)
-        # A view only works if every reader can take STRIDED memory. A `memref.collapse_shape`
-        # cannot: collapsing dims requires them to be contiguous, and a permuted view never is
-        # ("'memref.collapse_shape' op invalid source layout map or collapsing non-contiguous
-        # dims"). That is exactly the attention OUTPUT transpose, whose (H,T,hs) result is
-        # collapsed back to a 2-D (T, H*hs) operand for the output projection -- so it stays a
-        # real copy kernel. The hand payload avoids it differently, by having the attention
-        # kernel STORE through a strided view of the (T,C) buffer rather than transposing after.
+        # A `memref.collapse_shape` reader needs contiguous memory, which a permuted view
+        # never is. That is the attention output transpose: redirect its producer's stores
+        # instead of replacing the destination.
         if any(u.owner.operation.name == "memref.collapse_shape" for u in dst.uses):
-            # The other way round, then: leave the destination contiguous and make the
-            # kernel that PRODUCES the source store through a permuted view of it.
             if _redirect_transpose_writer(block, forall, perm, src, dst):
                 replaced_idx.add(idx)
             continue
-        # Build the view immediately BEFORE the copy kernel it replaces. That spot is after
-        # the source (the kernel reads it) and before every reader of the destination (they
-        # consume the kernel's result), so it dominates all of them. `ir.InsertionPoint(op)`
-        # inserts BEFORE `op`, so anchoring on the source itself would not dominate.
+        # Build the view right before the copy kernel: after the source and before every
+        # reader of the destination, so it dominates all of them.
         ip = ir.InsertionPoint(forall.operation)
         strides = _row_major_strides(list(src_type.shape))
         with ip:
@@ -1873,17 +1462,10 @@ def replace_transpose_kernels_with_views(mod, payload_func_name, plan, kernel_pa
                 layout=ir.StridedLayoutAttr.get(0, [strides[p] for p in perm]),
             )
             view = memref.transpose(view_type, src, pmap)
-        # Point the readers at the view -- but ONLY the ones in this writer's live range.
-        # A blind `replace_all_uses_with` is UNSOUND here: one-shot bufferization REUSES one
-        # alloc for the K and V head-major results (their lifetimes do not overlap), so the
-        # same buffer is written twice and read twice. Replacing every use would hand V's
-        # readers K's view -- which shows up as "operand #0 does not dominate this use",
-        # because one of those reads precedes the view. So: replace uses that sit after this
-        # copy kernel and before the next op that WRITES the same buffer.
+        # Only readers in this writer's live range: bufferization reuses one alloc for K's
+        # and V's head-major results, so a blind replace-all would hand V's readers K's view.
         ops = list(block.operations)
-        here = next(
-            i for i, o in enumerate(ops) if o.operation == forall.operation
-        )
+        here = next(i for i, o in enumerate(ops) if o.operation == forall.operation)
         next_writer = len(ops)
         for j in range(here + 1, len(ops)):
             if _writes_memref(ops[j], dst):
@@ -1916,8 +1498,8 @@ def replace_transpose_kernels_with_views(mod, payload_func_name, plan, kernel_pa
                 dst.owner.operation.erase()
         replaced_idx.add(idx)
 
-    # Only the entries actually replaced are dropped: a transpose whose reader needs
-    # contiguous memory keeps its kernel, and the tail matches one `gpu.module` per entry.
+    # Only the entries actually replaced are dropped; the tail matches one `gpu.module`
+    # per remaining entry.
     keep = [i for i in range(len(plan)) if i not in replaced_idx]
     return (
         [plan[i] for i in keep],
@@ -1927,22 +1509,11 @@ def replace_transpose_kernels_with_views(mod, payload_func_name, plan, kernel_pa
 
 
 def redirect_staged_destination_copies(mod, payload_func_name: str) -> int:
-    """Delete the staging buffer bufferization inserts for a SECOND destination slice.
+    """Delete the staging buffer bufferization inserts for a second destination slice.
 
-    WHY THIS EXISTS, for the record (2026-09-30 review). The staging is a one-shot
-    bufferization limitation, not a property of the payload: the tiled forall carries one
-    shared_out per slice and writes them back through an `insert_slice` chain, and the
-    analysis has no rule that lets that chain bufferize in place. Fixing it at the source needs
-    two pieces, neither small: a tensor-level rewrite that gives the forall the whole destination
-    as its single shared_out, and a disjoint-inserts rule in
-    `OneShotAnalysis.cpp::areNonConflictingSubsets` (drafted with lit tests as
-    `one-shot-bufferize-disjoint-inserts.patch`, next to this file; unbuilt). Judged too heavy
-    for the gain, so this memref-level fix-up stays.
-
-    Companion to `fuse_rope_halves`, and the reason that rewrite can run at all. One-shot
-    bufferization cannot prove that two `extract_slice` destinations of one buffer are
-    disjoint subsets, so for the second one it allocates a staging buffer and brackets the
-    kernel with host copies:
+    Companion to `fuse_sibling_slice_writers`. One-shot bufferization cannot prove that two
+    `extract_slice` destinations of one buffer are disjoint subsets, so for the second one it
+    allocates a staging buffer and brackets the kernel with host copies:
 
         %subview = memref.subview %dst[0, half] ...
         %alloc   = memref.alloc()
@@ -1950,54 +1521,46 @@ def redirect_staged_destination_copies(mod, payload_func_name: str) -> int:
         scf.forall { ... vector.transfer_write %v, %alloc[...] }
         memref.copy %alloc, %subview          <- out
 
-    Both copies are host accesses over DEVICE memory, which fault. This points the kernel's
-    write at `%subview` itself and drops the alloc and both copies.
+    Both copies are host accesses over device memory and fault. This points the kernel's
+    writes at `%subview` and drops the alloc and both copies. Sound because the kernel then
+    writes exactly the elements it wrote before into the buffer they came from, so unwritten
+    elements keep their value, which is all the copy in preserved. Allocs the kernel READS
+    are skipped, since a redirected read could observe an earlier write of the same loop.
+    Fixing this upstream needs a disjoint-inserts rule in one-shot analysis plus a
+    tensor-level rewrite of the forall's shared_outs; judged too heavy for the gain.
 
-    WHY IT IS SOUND, and note it needs no coverage argument: after the redirect the kernel
-    writes exactly the elements it wrote before, into the buffer those elements came from, so
-    whatever it does NOT write simply keeps the value it already had -- which is precisely
-    what the copy IN was there to preserve. The copy in has become a self-copy and the copy
-    out the identity. (This is also why the kernel must not READ the staging buffer: then the
-    redirect could observe a write made earlier in the same loop. Allocs that are read are
-    skipped.)
-
-    Disjointness from the OTHER destination -- the one bufferization did keep in place -- is
-    not re-derived here; it comes from `fuse_rope_halves`, which only ever merges two halves
-    writing offsets 0 and `half` of the same row range.
-
-    Runs in Python after bufferization and before the tail, the same slot as
-    `replace_transpose_kernels_with_views` -- which is what keeps it cheap: the kernel is
-    still an `scf.forall` in the host function, so no outlined `gpu.func` signature changes.
+    Runs after bufferization and before the tail, like `replace_transpose_kernels_with_views`.
     Returns the number of staging buffers removed.
     """
     func = get_payload_func_op(mod, payload_func_name)
     block = func.regions[0].blocks[0]
     removed = 0
-    # Iterate the copies OUT, not the allocs: bufferization REUSES one staging buffer across
-    # layers (measured -- at 2 layers `%alloc_15` is staged once per layer), so an alloc can
-    # have several, and an alloc-keyed pass skips exactly the multi-layer case. Each copy out
-    # is handled on its own, windowed to its live range, the same discipline
-    # `replace_transpose_kernels_with_views` needs for the shared K/V buffer.
+    # Iterate the copies out, not the allocs: bufferization reuses one staging buffer across
+    # layers, so an alloc can have several live ranges, each handled on its own.
     for copy_out in list(block.operations):
         if copy_out.operation.name != "memref.copy":
             continue
         buf, dest = copy_out.operands[0], copy_out.operands[1]  # (source, target)
-        if not isinstance(buf, ir.OpResult) or buf.owner.operation.name != "memref.alloc":
+        if (
+            not isinstance(buf, ir.OpResult)
+            or buf.owner.operation.name != "memref.alloc"
+        ):
             continue
-        if not isinstance(dest, ir.OpResult) or dest.owner.operation.name != "memref.subview":
+        if (
+            not isinstance(dest, ir.OpResult)
+            or dest.owner.operation.name != "memref.subview"
+        ):
             continue
         alloc = buf.owner
         dest_type, buf_type = ir.MemRefType(dest.type), ir.MemRefType(buf.type)
         if list(dest_type.shape) != list(buf_type.shape):
             continue
-        if list(ir.DenseI64ArrayAttr(dest.owner.attributes["static_strides"])) != [1] * (
-            dest_type.rank
-        ):
+        if list(ir.DenseI64ArrayAttr(dest.owner.attributes["static_strides"])) != [
+            1
+        ] * (dest_type.rank):
             continue  # non-unit strides would not map the kernel's indices 1:1
 
-        # This copy out's live range starts after the PREVIOUS copy out of the same buffer:
-        # each range is [optional copy in] -> kernel writes -> copy out, so those copies are
-        # the boundaries.
+        # This copy out's live range starts after the previous copy out of the same buffer.
         ops = list(block.operations)
         here = _top_level_index(copy_out, ops)
         window_start = -1
@@ -2014,23 +1577,20 @@ def redirect_staged_destination_copies(mod, payload_func_name: str) -> int:
             if owner.operation == copy_out.operation or name == "memref.dealloc":
                 continue
             if at is None or not (window_start < at < here):
-                continue  # belongs to another copy out's live range
+                continue  # belongs to another live range
             if name == "memref.copy" and use.operand_number == 1:
                 copies_in.append(owner)
             elif name == "vector.transfer_write" and use.operand_number == 1:
                 writes.append(owner)
             else:
-                disqualified = True  # anything else (notably a READ) makes this unsafe
+                disqualified = True  # anything else (notably a read) makes this unsafe
         if disqualified or not writes or len(copies_in) > 1:
             continue
         if copies_in and copies_in[0].operands[0] != dest:
             continue  # staged against a different buffer than it is written back to
 
-        # The copy OUT sits after the kernel, and so may its `memref.subview` -- in a whole
-        # block bufferization emits the subview next to the copy that uses it, below the
-        # loop. Writing to it from inside the loop then does not dominate, so hoist it above
-        # the first kernel that will write it. Only legal while its own operands already
-        # dominate that point (the base buffer and any dynamic offsets).
+        # Bufferization emits the subview next to the copy out, below the loop. Hoist it
+        # above the first kernel that writes it, if its own operands already dominate there.
         ops = list(block.operations)
         first_write = min(_top_level_index(w, ops) for w in writes)
         sub_op = dest.owner
@@ -2048,8 +1608,7 @@ def redirect_staged_destination_copies(mod, payload_func_name: str) -> int:
             write.operands[1] = dest
         for copy in copies_in + [copy_out]:
             copy.operation.erase()
-        # The buffer and its dealloc go only once NOTHING else uses it -- with a staging
-        # buffer shared across layers the later live ranges still do.
+        # The buffer and its dealloc go only once nothing else uses it.
         if not [u for u in buf.uses if u.owner.operation.name != "memref.dealloc"]:
             for use in list(buf.uses):
                 if use.owner.operation.name == "memref.dealloc":
@@ -2071,16 +1630,13 @@ def _index_value(v):
 def fold_gqa_broadcasts(mod, payload_func_name, plan, kernel_params):
     """Delete the GQA K/V broadcast kernels; their readers index the source directly.
 
-    torch-mlir spells `repeat_interleave(n_rep, 0)` as a broadcast `linalg.generic` that
-    MATERIALIZES K and V at the query-head count -- two copy kernels per layer and 4x the KV
-    read traffic, against a hand payload whose K/V indexing map simply OMITS the `rep` dim and
-    an Inductor capture that hands SDPA the 8-head tensor as-is. Every route to the zero-copy
-    form at the TENSOR level was measured and rejected (`_gqa_probe.py`, §3d of the plan doc:
-    the fold needs `linalg-fuse-elementwise-ops`, which cannot be scoped and rewrites every
-    projection into a generic; the flat `(n_kv, n_rep*T, hs)` payload needs two library
-    changes and dies in bufferization on a middle unit dim).
+    torch-mlir spells `repeat_interleave(n_rep, 0)` as a broadcast generic that materializes
+    K and V at the query-head count: two copy kernels per layer and 4x the KV read traffic.
+    The hand payload's K/V indexing map simply omits the `rep` dim, and Inductor hands SDPA
+    the 8-head tensor as-is. Tensor-level fixes were measured and rejected: they need
+    `linalg-fuse-elementwise-ops`, which rewrites every projection into a generic.
 
-    After bufferization the problem is trivial, because both sides are already explicit:
+    After bufferization both sides are explicit:
 
         scf.forall (%kv, %rep, %t) {                              <- the broadcast kernel
           %x = vector.transfer_read %k_view[%kv, %t, 0]
@@ -2090,21 +1646,17 @@ def fold_gqa_broadcasts(mod, payload_func_name, plan, kernel_params):
         %kv, %rep = affine.delinearize_index %head into (n_kv, n_rep)   <- inside attention
         %k = vector.transfer_read %k_bcast[%kv, %rep, %j, 0]
 
-    The broadcast writes `dst[kv, rep, t]` from `src[kv, t]`, so a reader of `dst[a, b, c]` is
-    a reader of `src[a, c]`: rewrite each reader in the kernel's live range to index the
-    source with the broadcast dims dropped, and the copy kernel, its buffer and its dealloc
-    are dead. The source here is the head-major `memref.transpose` view that
-    `replace_transpose_kernels_with_views` already made, so K and V are read straight out of
-    the projection buffers -- exactly the hand payload's `_grouped_heads_view_of` -- and the
-    attention kernel's three loads (Q, K, V) all become strided reads of the same kind, which
-    is what its layout annotation expects.
+    A reader of `dst[a, b, c]` is a reader of `src[a, c]`, so each reader in the kernel's
+    live range is rewritten to index the source with the broadcast dims dropped, and the
+    kernel, its buffer and its dealloc die. K and V are then read straight out of the
+    projection buffers through the head-major views `replace_transpose_kernels_with_views`
+    made, so the attention kernel's three loads are all strided reads of the same kind.
 
     Recognised shape: a forall holding exactly one `transfer_read` + one `transfer_write`,
-    whose write indices are a superset of its read indices IN ORDER (the extra ones are the
-    broadcast dims), the broadcast dims all outside the vector-covered trailing dims, and
-    trailing shapes equal. The rewrite is windowed to the copy's live range, because
-    bufferization reuses one alloc across layers (the same trap the transpose views and the
-    RoPE staging buffers both hit).
+    whose write indices contain the read indices in order (the extra ones are the broadcast
+    dims), with the broadcast dims outside the vector-covered trailing dims and equal
+    trailing shapes. Windowed to the copy's live range, since bufferization reuses allocs
+    across layers.
 
     Returns the plan and params with the broadcast entries dropped, for the tail.
     """
@@ -2157,7 +1709,10 @@ def fold_gqa_broadcasts(mod, payload_func_name, plan, kernel_params):
             continue
         if any(src_type.shape[i] != dst_type.shape[m] for i, m in enumerate(mapping)):
             continue
-        if not isinstance(dst, ir.OpResult) or dst.owner.operation.name != "memref.alloc":
+        if (
+            not isinstance(dst, ir.OpResult)
+            or dst.owner.operation.name != "memref.alloc"
+        ):
             continue
 
         # Live range of this copy: readers after it and before the next writer of `dst`.
@@ -2178,13 +1733,14 @@ def fold_gqa_broadcasts(mod, payload_func_name, plan, kernel_params):
             if at is None or not (here < at < next_writer):
                 continue
             if name != "vector.transfer_read" or use.operand_number != 0:
-                readers = None  # something other than a plain read; leave it materialized
+                readers = (
+                    None  # something other than a plain read; leave it materialized
+                )
                 break
             readers.append(owner)
         if not readers:
             continue
-        # Every reader must cover the same trailing dims with a minor-identity map, i.e. be
-        # the same kind of read the broadcast kernel itself did.
+        # Every reader must be the same kind of minor-identity read the broadcast kernel did.
         ok = True
         for rd in readers:
             if ir.VectorType(rd.results[0].type).rank != vec_rank:
@@ -2194,14 +1750,9 @@ def fold_gqa_broadcasts(mod, payload_func_name, plan, kernel_params):
                 ok = False
         if not ok:
             continue
-        # The SOURCE must still hold the same data when the reader runs. The copy kernel is
-        # what decoupled the two, and bufferization exploits that: without the transpose
-        # views, K's and V's head-major results share ONE alloc (their lifetimes do not
-        # overlap), so by the time attention runs, K's source buffer holds V. Folding then
-        # reads V twice -- and the two identical loads CSE into one, which the attention
-        # annotation reports as "expected to contain 3 payloads but it contains 2". So if
-        # anything writes the source's underlying buffer between the copy and a reader, keep
-        # this one materialized. (Windowing the destination alone is not enough.)
+        # The source must still hold the same data when the reader runs. Bufferization can
+        # give K's and V's head-major results one alloc, so if anything writes the source's
+        # underlying buffer between the copy and a reader, keep this one materialized.
         src_base = src
         while True:
             owner = src_base.owner
@@ -2212,7 +1763,9 @@ def fold_gqa_broadcasts(mod, payload_func_name, plan, kernel_params):
                 break
             src_base = owner.operation.operands[0]
         last_reader = max(_top_level_index(rd, ops) for rd in readers)
-        if any(_writes_memref(ops[j], src_base) for j in range(here + 1, last_reader + 1)):
+        if any(
+            _writes_memref(ops[j], src_base) for j in range(here + 1, last_reader + 1)
+        ):
             continue
 
         new_map = ir.AffineMap.get_minor_identity(src_type.rank, vec_rank)
@@ -2254,9 +1807,9 @@ def _emit_tail_after_bufferize(
 ):
     """Emit the post-bufferization half of the tail: promote, outline, per-kernel XeGPU.
 
-    Split out of `generic_schedule` so it can also run as a SECOND schedule, after a Python
-    pass has rewritten the bufferized module (see `replace_transpose_kernels_with_views`).
-    `plan` and `kernel_params` must line up with the `scf.forall`s that are actually left.
+    Split out of `generic_schedule` so it can also run as a second schedule after a Python
+    pass has rewritten the bufferized module. `plan` and `kernel_params` must line up with
+    the `scf.forall`s that are actually left.
     """
     if has_reduction:
         pfunc = get_payload_func(mod, func_name=payload_func_name)
@@ -2295,14 +1848,11 @@ def _emit_tail_after_bufferize(
             transform.yield_()
 
         if entry["kind"] == "attention":
-            # Reused from the hand schedule rather than re-derived: it anchors the one
-            # store_nd, the three load_nd (Q hoisted, then K and V in the flash loop)
-            # and both dpas ops.
+            # Shared with the hand schedule: anchors the store_nd, the three load_nd
+            # (Q hoisted, then K and V in the flash loop) and both dpas ops.
             xegpu_fa_annotation(gpu_func, params)
         elif entry["kind"] in _CONTRACTION_KINDS:
-            xegpu_wg_annotation_for_mlp_layer(
-                gpu_func, gpu_specs=gpu_specs, **params
-            )
+            xegpu_wg_annotation_for_mlp_layer(gpu_func, gpu_specs=gpu_specs, **params)
         elif entry["kind"] == "reduction":
             # Rows across subgroups, rss-wide blocks per subgroup. Anchor the stores;
             # layout propagation derives the loads.
@@ -2315,8 +1865,8 @@ def _emit_tail_after_bufferize(
                     sg_data=sg_data,
                 )
         else:
-            # 2-D for every elementwise kernel, including ones that started rank > 2:
-            # the unit-extent folding after tiling collapsed those to 2-D.
+            # 2-D for every elementwise kernel: unit-extent folding collapsed the rank > 2
+            # ones after tiling.
             xegpu_wg_annotation_for_elemwise_layer(
                 gpu_func, gpu_specs=gpu_specs, **params
             )
@@ -2333,9 +1883,8 @@ def generic_schedule_tail(
 ) -> ir.Module:
     """The post-bufferization half of `generic_schedule`, as a standalone schedule.
 
-    Used with `generic_schedule(..., stop_after_bufferize=True)` when something has to run on
-    the bufferized module in Python -- which is the only way to do a MEMREF-level rewrite,
-    since the transform dialect has no op for "replace this copy with a view".
+    Used with `generic_schedule(..., stop_after_bufferize=True)` when a memref-level rewrite
+    has to run on the bufferized module in Python.
     """
     gpu_specs = XeGPUParameterSelector(device=device).gpu_specs
     has_reduction = any(e["kind"] == "reduction" for e in plan)
@@ -2352,38 +1901,26 @@ def generic_schedule_tail(
 
 
 def _emit_empty_tensor_elimination(func, mod):
-    """Decompose `tensor.concat` and eliminate empty tensors, BEFORE any tiling.
+    """Decompose `tensor.concat` and eliminate empty tensors, before any tiling.
 
-    Split out of `generic_schedule` so it can also run as a standalone schedule ahead of a
-    Python rewrite that needs the destinations already resolved (`fuse_rope_halves`).
+    Also run standalone (`eliminate_empty_tensors_schedule`) ahead of `fuse_rope_halves`.
     Running it twice is harmless: rounds past the chain depth are no-ops.
     """
-    # Decompose `tensor.concat` into `insert_slice`s. A concat is real data movement
-    # with no tiling interface, so it bufferizes into copies that sit OUTSIDE every
-    # kernel -- host accesses over device buffers, which fault at run time. An
-    # `insert_slice` can instead be folded away entirely by the elimination below.
+    # `tensor.concat` has no tiling interface and bufferizes into host copies over device
+    # buffers; as `insert_slice`s it is folded away by the elimination below.
     with ir.InsertionPoint(transform.apply_patterns(func).patterns):
         tensor_transform.apply_patterns_tensor_decompose_concat()
     lh_transform.cleanup(func)
 
-    # Eliminate empty tensors HERE, before tiling -- `bufferize()` runs this too, but
-    # by then it is too late. A payload that assembles its result from slices (RoPE
-    # writing two rotated halves) reads as `tensor.empty` -> `insert_slice` ->
-    # `insert_slice` -> `materialize_in_destination(arg0)`. Run now, elimination
-    # rewrites each producer's `outs` to an `extract_slice` OF arg0, so the kernels
-    # write their halves straight into the output and both `insert_slice`s become
-    # no-ops that bufferize away. Run after tiling, those same empties have become
-    # `scf.forall` inits, the insert_slices survive into the host function and get
-    # VECTORIZED there -- a `vector<1024x32xf16>` transfer pair over device memory,
-    # which faults.
+    # Eliminate empty tensors BEFORE tiling. A payload that assembles its result from slices
+    # reads as `tensor.empty -> insert_slice -> ... -> materialize_in_destination(arg0)`;
+    # eliminated now, each producer writes straight into its slice of the output and the
+    # inserts bufferize away. After tiling the empties are forall inits, the inserts survive
+    # into the host function and get vectorized there, which faults on device memory.
     #
-    # Iterated because one round only peels one level of an insert_slice chain: it
-    # rewrites the chain's destination to arg0, but a producer it already redirected
-    # still points at the now-dead intermediate empty. `fold_tensor_empty` between
-    # rounds is what makes progress possible -- it turns that stale
-    # `extract_slice(empty)` back into a plain `empty` for the next round to eliminate.
-    # (It is a pattern set, not a canonicalization, so `cleanup` alone does nothing and
-    # the loop would spin without it.) Rounds past the chain depth are no-ops.
+    # One round peels one level of the chain; `fold_tensor_empty` between rounds turns the
+    # stale `extract_slice(empty)` back into an `empty` for the next round (it is a pattern
+    # set, not a canonicalization, so `cleanup` alone would spin). Extra rounds are no-ops.
     for _ in range(_EMPTY_ELIM_ROUNDS):
         bufferization_transform.bufferization_eliminate_empty_tensors(mod)
         with ir.InsertionPoint(transform.apply_patterns(func).patterns):
@@ -2392,14 +1929,12 @@ def _emit_empty_tensor_elimination(func, mod):
 
 
 def eliminate_empty_tensors_schedule(payload_func_name: str) -> ir.Module:
-    """Just the empty-tensor-elimination preamble, as its own schedule.
+    """The empty-tensor-elimination preamble as its own schedule.
 
-    `fuse_rope_halves` has to run with the RoPE destination already rooted at the real
-    output buffer: while it is still an intermediate `tensor.empty`, the `fold_tensor_empty`
-    pattern collapses the `extract_slice(empty)` destinations the merged op needs back into
-    bare `empty`s, and the upper half then reaches the output through a HOST `insert_slice`
-    over device memory (which faults). So drivers that fuse run this first, then fuse, then
-    `classify_payload`.
+    `fuse_rope_halves` needs the RoPE destination already rooted at the real output buffer:
+    otherwise `fold_tensor_empty` collapses the merged op's `extract_slice(empty)`
+    destinations and the second half reaches the output through a host `insert_slice` over
+    device memory. Drivers run this, then fuse, then `classify_payload`.
     """
     with schedule_boilerplate() as (schedule, named_seq):
         anytype = transform.AnyOpType.get()
@@ -2438,21 +1973,16 @@ def generic_schedule(
 
         _emit_empty_tensor_elimination(func, mod)
 
-        # One handle per op, per op name. Handles stay in program order and stay valid
-        # while other ops are tiled, so they can be consumed in plan order.
-        # One handle per op, per op name, INDEXED BY IR POSITION. Popping in plan order is
-        # wrong: a group can own a member that sits earlier in the IR than another group's
-        # member of the same name (attention absorbs the K^T transpose, which precedes
-        # nothing in particular), and then every later handle of that name is off by one --
-        # which silently hands a kernel another kernel's tile params and fails as
-        # "'xegpu.load_nd' op TensorDesc shape is not distributable with the layout".
+        # One handle per op per op name, indexed by IR position (the ordinals from
+        # `classify_payload`). Popping in plan order would be off by one after an absorbed
+        # member and hand kernels each other's tile params.
         queues: dict[str, list] = {}
         for op_name in {m for e in plan for m in e["members"]}:
             count = sum(1 for e in plan for m in e["members"] if m == op_name)
             queues[op_name] = list(match_and_split(func, ops={op_name}, nhandles=count))
 
         for entry, params in zip(plan, kernel_params):
-            # The group's LAST member is its output, and that is what gets tiled.
+            # The group's last member is its output, and that is what gets tiled.
             member, ordinal = entry["handles"][-1]
             handle = queues[member][ordinal]
 
@@ -2489,32 +2019,20 @@ def generic_schedule(
                 )
         lh_transform.cleanup(func)
 
-        # Generalize tiled transposes to generics. `linalg.transpose` is a NAMED op and the
-        # unit-extent folding below only rewrites generics, so a tiled transpose keeps its
-        # rank-3 slices -- and because the read is permuted, the unit dim lands in the
-        # MIDDLE of the input slice (`tensor_desc<128x1x64xf16>`), which fails with
-        # "'xegpu.load_nd' op TensorDesc shape is not distributable with the layout".
-        # Generalizing gives the equivalent permuted-read generic, which the folding can
-        # collapse to 2-D. Note this happens AFTER tiling on purpose: classification and
-        # tile-size choice need to see a `linalg.transpose` (its own kind, blocked by output
-        # rows), not an anonymous all-parallel generic that would be taken for elementwise.
+        # Generalize tiled transposes: the unit-extent folding below only rewrites generics,
+        # and a tiled `linalg.transpose` keeps a middle unit dim in its input slice that is
+        # not distributable. After tiling on purpose: classification and tile-size choice
+        # need to see a `linalg.transpose`, not an anonymous all-parallel generic.
         if any(e["kind"] == "transpose" for e in plan):
             structured.structured_generalize(
                 anytype, match(func, ops={"linalg.transpose"})
             )
             lh_transform.cleanup(func)
 
-        # Collapse rank > 2 kernels to 2-D. XeGPU's work-group->subgroup distribution
-        # wants 2-D vectors: a rank-3 tensor desc rejects a 2-D layout outright, and a
-        # rank-matched layout is accepted but then distributes into an inconsistent
-        # vector.shape_cast. Tiling above already made every middle dim 1
-        # (`_ew_tile_sizes`), so folding unit extents HERE -- after tiling, on the tiled
-        # ops -- rewrites those generics to rank 2 and the ordinary 2-D layouts apply.
-        #
-        # Note this is the same pattern that must NOT run before tiling: there it
-        # collapses a reduction's accumulator and breaks vectorization (see
-        # torch_mlir_rmsnorm_gpu.py). Timing is what makes it safe, and it is gated on a
-        # rank > 2 kernel actually being present to keep the blast radius small.
+        # Collapse rank > 2 kernels to 2-D: XeGPU work-group distribution wants 2-D vectors.
+        # Tiling made every middle dim 1, so folding unit extents here rewrites those
+        # generics to rank 2. It must not run before tiling (it collapses a reduction's
+        # accumulator and breaks vectorization), and is gated on a rank > 2 kernel existing.
         if any(_rank(e["shape"]) > 2 for e in plan):
             with ir.InsertionPoint(transform.apply_patterns(func).patterns):
                 structured.apply_patterns_linalg_fold_unit_extent_dims_via_slices()
@@ -2524,10 +2042,9 @@ def generic_schedule(
             transform.yield_()
             return schedule
 
-        # The tail, spelled out rather than via `vectorize_bufferize_and_outline_gpu_func`,
-        # for two reasons: vectorization is scoped (below), and a reduction needs
-        # `promote-buffers-to-stack` inserted after bufferization, which the reusable
-        # helper omits (the hand tail runs it).
+        # The tail is spelled out rather than `vectorize_bufferize_and_outline_gpu_func`:
+        # vectorization is scoped, and a reduction needs `promote-buffers-to-stack` after
+        # bufferization.
         _vectorize_kernels_only(func)
         mod = _bufferize_keeping_transpose_subviews(mod, payload_func_name, plan)
         if stop_after_bufferize:

@@ -1,8 +1,12 @@
-"""GPU driver: a MULTI-LAYER Llama-3 (n blocks + final RMSNorm + LM head) from torch-mlir.
+# RUN: %PYTHON %s --layers 1 --inspect | FileCheck %s
+# REQUIRES: torch_mlir
+# CHECK: tiled OK
 
-This is A10: stacking. `torch_mlir_block_gpu.py` proved one decoder block; this one proves the
-whole model, which is what the hand-written-payload path already does
-(`examples/llama/test_llama3_gpu.py`, and `llama3_actual_data` at real Llama-3.2-1B weights).
+"""GPU driver: a multi-layer Llama-3 (n blocks + final RMSNorm + LM head) from torch-mlir.
+
+The torch-mlir counterpart of `llama3.py`: the payload comes from `llama3_torch_model.py`
+through torch-mlir instead of the hand-written `Builder`, and `llama3_torch_schedule.py`
+derives the kernel plan from the IR.
 
 Nothing about the schedule is layer-aware -- `classify_payload` just walks the IR, so N layers
 is N times the plan. What stacking actually tests is whether anything in the flow is
@@ -137,7 +141,9 @@ class HFParamLlama(nn.Module):
         H, n_kv = cfg.num_attention_heads, cfg.num_key_value_heads
         size = {"C": C, "hidden": hidden, "kv": n_kv * (C // H)}
         self.n_layers = n_layers
-        self.llama = Llama3(C, hidden, cfg.vocab_size, H, n_kv, n_layers, cfg.rms_norm_eps)
+        self.llama = Llama3(
+            C, hidden, cfg.vocab_size, H, n_kv, n_layers, cfg.rms_norm_eps
+        )
         self.params = nn.ParameterDict()
         for i in range(n_layers):
             for name in ("input_layernorm", "post_attention_layernorm"):
@@ -149,7 +155,9 @@ class HFParamLlama(nn.Module):
                     torch.empty(size[in_f], size[out_f])
                 )
         self.params[_key("model.norm.weight")] = nn.Parameter(torch.ones(C))
-        self.params[_key("lm_head.weight")] = nn.Parameter(torch.empty(C, cfg.vocab_size))
+        self.params[_key("lm_head.weight")] = nn.Parameter(
+            torch.empty(C, cfg.vocab_size)
+        )
 
     def weight_pack(self):
         """The weights in `Llama3.forward` order: n_layers * BLOCK_WEIGHTS, final norm, LM head."""
@@ -366,7 +374,9 @@ def main():
             plan,
             kernel_params,
             inspect=args.inspect,
-            stop_after_bufferize=args.transpose_views or args.fuse_halves or args.fold_gqa,
+            stop_after_bufferize=args.transpose_views
+            or args.fuse_halves
+            or args.fold_gqa,
         )
         if args.inspect:
             TransformDriver(schedules=[sched]).apply(mod)
@@ -374,7 +384,7 @@ def main():
             return 0
 
         if args.transpose_views or args.fuse_halves or args.fold_gqa:
-            # Three stages, as in torch_mlir_block_gpu.py: schedule up to bufferization, apply
+            # Three stages: schedule up to bufferization, apply
             # the rewrites the transform dialect has no ops for (copy -> view; staged
             # destination -> the destination itself; broadcast -> indexed read), then the
             # tail over what is left. The GQA fold reads K/V through the views, so it is last.
@@ -468,7 +478,7 @@ def main():
                 f"; logits rel={hf_rel:.6f}"
             )
 
-        # Same guard as torch_mlir_block_gpu.py, and it matters more here: with N layers the
+        # Zero-attention guard. With N layers the
         # residual stream grows while each layer's attention contribution does not, so a
         # dropped attention term is an even smaller share of the output.
         zero_ref = reference(

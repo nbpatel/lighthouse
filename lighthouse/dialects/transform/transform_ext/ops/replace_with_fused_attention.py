@@ -296,23 +296,25 @@ class ReplaceWithFusedAttentionOp(
             for handle in (op.q, op.k, op.v, op.scale, op.output):
                 handle_ops = state.get_payload_ops(handle)
                 if len(handle_ops) != 1:
-                    raise ValueError("Expected exactly one operation for each operand")
+                    return DiagnosedSilenceableFailure.emit_silenceable_error(
+                        "Expected exactly one operation for each operand"
+                    )
                 payloads.append(handle_ops[0])
             q_op, k_op, v_op, scale_op, output_op = payloads
 
             if not isinstance(scale_op.opview, arith.ConstantOp):
-                raise ValueError(
+                return DiagnosedSilenceableFailure.emit_silenceable_error(
                     f"Expected scale to be arith.constant, got {scale_op.name}"
                 )
             if not output_op.name.startswith("linalg."):
-                raise ValueError(
+                return DiagnosedSilenceableFailure.emit_silenceable_error(
                     f"Expected output to be a linalg op, got {output_op.name}"
                 )
 
             q, k, v = (payload.results[0] for payload in (q_op, k_op, v_op))
             for name, value in (("q", q), ("k", k), ("v", v)):
                 if not isinstance(value.type, ir.RankedTensorType):
-                    raise ValueError(
+                    return DiagnosedSilenceableFailure.emit_silenceable_error(
                         f"Expected {name} to produce a ranked tensor, got {value.type}"
                     )
 

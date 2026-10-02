@@ -34,8 +34,7 @@ EPS = 1e-5
 def _rms_norm(x, weight, eps):
     """x * rsqrt(mean(x^2) + eps) * weight, over the last dim.
 
-    Written to lower on XeGPU, not just to read naturally (see
-    torch_mlir_rmsnorm_gpu.py for the full reasoning):
+    Written to lower on XeGPU, not just to read naturally:
       - `x*x` instead of `pow(x, 2)`, so it legalizes to CPU libm.
       - the reciprocal square root is spelled `y ** -0.5`, and it is the ONLY spelling
         measured to work on both paths. The three alternatives:
@@ -64,8 +63,7 @@ def _rms_norm(x, weight, eps):
 
         The cause is the sum of squares: `ssq` is ~1 built from 2048 terms of ~5e-4, and near
         1.0 the f16 spacing is ~1e-3, so each addition rounds away much of the term being
-        added. Both references we compare against do it in f32 -- the hand payload norms in f32
-        (`llama3_weights.py` loads the norm gains as f32 for that reason), and transformers'
+        added. Both references we compare against do it in f32 -- the hand payload norms in f32, and transformers'
         `LlamaRMSNorm` upcasts to f32 internally on every fp16 inference path; Inductor's F0
         lists "FP32 accumulation of sum of squares" too.
         The GAIN stays in the input dtype and is applied AFTER the cast back: `weight.float()`
@@ -172,13 +170,13 @@ class LlamaBlock(nn.Module):
             becomes the max reduction's nearest generic ancestor, defeating the scale
             search.
 
-        Consequence to keep in mind: the CPU oracle (`llama3_torch_mlir_check.py`) lowers
-        this payload without that schedule, so it validates NON-CAUSAL math. It is checking
+        Consequence to keep in mind: lowering this payload without that schedule (e.g. a CPU
+        reference run) validates NON-CAUSAL math. It is checking
         that torch-mlir lowers what PyTorch computes, which it still does; it is not
         checking Llama's autoregressive semantics.
 
-        Softmax is spelled by hand, without `keepdim`, for two separate lowering reasons --
-        see `torch_mlir_attention_gpu.py`: `torch.softmax` upcasts f16 to f32 and the
+        Softmax is spelled by hand, without `keepdim`, for two separate lowering reasons:
+        `torch.softmax` upcasts f16 to f32 and the
         attention XeGPU layouts are f16-only, and a `keepdim` reduction gets an output map
         that is not a permuted projection, which tiling refuses.
         """
@@ -194,7 +192,7 @@ class LlamaBlock(nn.Module):
         # torch-mlir folds into one permutation and hoists into its own kernel -- hands the
         # rewrite an already-transposed operand and its Q/K layouts then land on the wrong
         # loads ("'xegpu.load_nd' op TensorDesc shape is not distributable"). Note that
-        # pre-transposing IS what zero-copy GQA would want (`_gqa_probe.py`), so the two
+        # pre-transposing IS what zero-copy GQA would want, so the two
         # wishes conflict; correctness wins until GQA materialization is revisited.
         qh = q.view(t, H, hs).transpose(0, 1)
         kh = k.view(t, n_kv, hs).transpose(0, 1).repeat_interleave(n_rep, dim=0)
